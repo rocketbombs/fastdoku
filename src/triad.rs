@@ -194,6 +194,10 @@ impl C16 {
     #[inline(always)]
     unsafe fn any_less_than(self, o: C16) -> bool {
         let lt = _mm256_cmpgt_epi16(o.0, self.0);
+        // Deliberately a movemask rather than the shorter PTEST form: PTEST
+        // keeps the check on the vector ports, which are the bottleneck in
+        // this loop, while movemask hands it to the integer side. Measured
+        // ~1% faster despite costing an extra instruction.
         _mm256_movemask_epi8(lt) != 0
     }
     /// Per-lane popcount, assuming the 7 high bits of every lane are zero.
@@ -609,7 +613,10 @@ unsafe fn box_restrict_full<const FROM_VERTICAL: usize>(
         state.bands.get_unchecked_mut(box_i).get_unchecked_mut(0).eliminations = h_elims;
         state.bands.get_unchecked_mut(box_j).get_unchecked_mut(1).eliminations = v_elims;
 
-        if !eliminating.intersects(*state.boxen.get_unchecked(box_idx)) {
+        // `cells` was just stored to boxen[box_idx] and nothing since has
+        // touched it, so test the value we already hold rather than making
+        // the compiler reload it.
+        if !eliminating.intersects(cells) {
             break;
         }
     }
@@ -639,7 +646,11 @@ unsafe fn band_eliminate<const VERTICAL: usize>(
 /// Apply a band's pending configuration eliminations, run the triad-count
 /// clause (a triad with exactly 3 remaining digits pins all three), and
 /// forward the restriction messages to the band's three box peers.
-unsafe fn band_eliminate_full<const VERTICAL: usize>(
+///
+/// `sysv64`: under the Windows x64 ABI xmm6-xmm15 are callee-saved, so every
+/// entry to this recursive function spills and reloads ten vector registers.
+/// The SysV convention treats all of them as volatile.
+unsafe extern "sysv64" fn band_eliminate_full<const VERTICAL: usize>(
     state: &mut TState,
     band_idx: usize,
     from_peer: usize,

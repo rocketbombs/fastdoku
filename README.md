@@ -25,14 +25,14 @@ puzzle to the first solution.
 
 | Dataset | puzzles | **fastdoku** | tdoku | tdoku+fastpath\* | vs tdoku | vs +fastpath |
 |---------|--------:|-------------:|------:|-----------------:|---------:|-------------:|
-| puzzles0_kaggle             |   100,000 | **922 ns** | 1109 ns | 1042 ns | 1.20x | 1.13x |
-| puzzles1_unbiased           | 1,000,000 | **2.389 us** | 2.811 | 2.536 | 1.18x | 1.06x |
-| puzzles2_17_clue            |    49,158 | **2.518 us** | 3.060 | 2.725 | 1.22x | 1.08x |
-| puzzles7_serg_benchmark     |    10,000 | **1.551 us** | 1.834 | 1.623 | 1.18x | 1.05x |
-| puzzles3_magictour_top1465  |     1,465 | **5.058 us** | 5.777 | 5.254 | 1.14x | 1.04x |
-| puzzles4_forum_hardest_1905 | 2,135,371 | **18.87 us** | — | 19.54 | — | 1.04x |
-| puzzles5_forum_hardest_11+  |    48,766 | **22.72 us** | 25.57 | 23.38 | 1.13x | 1.03x |
-| puzzles6_forum_hardest_1106 |       375 | **36.37 us** | 40.84 | 37.63 | 1.12x | 1.03x |
+| puzzles0_kaggle             |   100,000 | **911 ns** | 1104 ns | 989 ns | 1.21x | 1.09x |
+| puzzles1_unbiased           | 1,000,000 | **2.351 us** | 2.820 | 2.538 | 1.20x | 1.08x |
+| puzzles2_17_clue            |    49,158 | **2.466 us** | 3.061 | 2.732 | 1.24x | 1.11x |
+| puzzles7_serg_benchmark     |    10,000 | **1.531 us** | 1.826 | 1.624 | 1.19x | 1.06x |
+| puzzles3_magictour_top1465  |     1,465 | **4.960 us** | 5.765 | 5.251 | 1.16x | 1.06x |
+| puzzles4_forum_hardest_1905 | 2,135,371 | **18.46 us** | — | 19.54 | — | 1.06x |
+| puzzles5_forum_hardest_11+  |    48,766 | **22.20 us** | 25.45 | 23.41 | 1.15x | 1.05x |
+| puzzles6_forum_hardest_1106 |       375 | **35.59 us** | 41.06 | 37.65 | 1.15x | 1.06x |
 
 \* **tdoku+fastpath is tdoku with fastdoku's one structural optimization
 backported** (see below). It is not upstream tdoku; it exists to isolate how
@@ -45,10 +45,9 @@ Multithreaded (embarrassingly parallel, 16 threads, full corpora):
 
 | Dataset | puzzles | per puzzle | throughput |
 |---------|--------:|-----------:|-----------:|
-| puzzles0_kaggle             |   100,000 | 125 ns | 7.97M/s |
-| puzzles1_unbiased           | 1,000,000 | 189 ns | 5.28M/s |
-| puzzles2_17_clue            |    49,158 | 228 ns | 4.38M/s |
-| puzzles5_forum_hardest_11+  |    48,766 | 1.85 us | 540K/s |
+| puzzles0_kaggle             |   100,000 | 87 ns | 11.51M/s |
+| puzzles1_unbiased           | 1,000,000 | 186 ns | 5.37M/s |
+| puzzles2_17_clue            |    49,158 | 208 ns | 4.80M/s |
 | puzzles4_forum_hardest_1905 | 2,135,371 | 1.71 us | 586K/s |
 
 ### Verification
@@ -132,9 +131,22 @@ this to tdoku recovers most of its deficit, which is why it is broken out as
 its own column above. It is worth ~11% here and would be worth less on
 SysV (Linux/macOS), where no vector registers are callee-saved.
 
-Two other measured wins: branchless clue scanning at initialization (find
-clue positions with three `vpcmpeqb` + bit-scan instead of a per-cell branch,
-~5% on easy puzzles), and PGO (1.5-4%).
+Three other measured wins:
+
+- **`extern "sysv64"` on the recursive propagation function** (~2%). Windows
+  x64 makes `xmm6`-`xmm15` callee-saved, so every entry to a function that
+  uses the full vector file spills and reloads ten of them. SysV treats all
+  sixteen as volatile. This cut the prologue from 19 instructions (8 pushes,
+  a 248-byte frame, 10 vector spills) to 7, leaving only 2 genuine spills.
+- **Branchless clue scanning** at initialization: locate clue cells with
+  three `vpcmpeqb` + bit-scan rather than a per-cell branch (~5% on easy
+  puzzles).
+- **PGO** (1.5-4%).
+
+One measured *loss* worth recording: rewriting the contradiction check from
+`movemask`+`cmp` to the shorter `vptest` form removed an instruction but ran
+~1% slower. This loop is vector-port bound, so moving the test onto the
+integer ports is worth more than the instruction it costs.
 
 ### Other engines
 
