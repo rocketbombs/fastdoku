@@ -1,272 +1,233 @@
 # fastdoku
 
-A fast, complete sudoku solver in Rust. Solves any valid 9x9 sudoku, proves
-uniqueness (or counts solutions to a limit), detects unsolvable and
-multi-solution puzzles, and generates random minimal puzzles.
+A complete sudoku solver in Rust. Solves any valid 9x9 grid, proves
+uniqueness, counts solutions to a limit, and generates minimal puzzles.
 
-On this machine it is faster than [tdoku](https://github.com/t-dillon/tdoku),
-the fastest published sudoku solver, on all eight of tdoku's own benchmark
-corpora. The margin and exactly where it comes from are broken out below --
-including the part that is an optimization tdoku could simply adopt.
+It is a port of [tdoku](https://github.com/t-dillon/tdoku)'s DPLL + triad +
+SIMD architecture — the design is Tom Dillon's — plus a set of scheduling and
+ABI changes that make it faster than tdoku on every one of tdoku's own
+benchmark corpora.
 
 ## Results
 
-Benchmarked **on the same machine, the same data, and the same harness**.
-tdoku is built from source here and driven by
-[`bench/tdoku_bench.cc`](bench/tdoku_bench.cc), which mirrors fastdoku's own
-`bench` command: same parsing, same in-memory puzzle vector, same best-of-N
-protocol, same solution checksum. Both are built `-march=native` /
-`-C target-cpu=native`, both with LTO, both with PGO (PGO helps fastdoku
-1.5-4%; it did not help tdoku).
+Same machine, same data, same harness. tdoku is built from source here and
+driven by [`bench/tdoku_bench.cc`](bench/tdoku_bench.cc), which mirrors
+fastdoku's `bench` command exactly: same parsing, same in-memory puzzle
+vector, same best-of-N protocol, same solution checksum. Both are built
+`-march=native` / `-C target-cpu=native`, both with LTO, both offered PGO
+(it helps fastdoku 1.5-4%; it did nothing for tdoku).
 
-Machine: Ryzen 7 5700X (Zen 3, 8C/16T, AVX2, no AVX-512), Windows 11,
-rustc 1.98 / clang 22. Single thread, best-of-N, full corpora, time per
-puzzle to the first solution.
+Ryzen 7 5700X (Zen 3, 8C/16T, AVX2, no AVX-512), Windows 11, rustc 1.98 /
+clang 22. Single thread, best-of-N, full corpora, time to first solution.
 
-| Dataset | puzzles | **fastdoku** | tdoku | tdoku+fastpath\* | vs tdoku | vs +fastpath |
-|---------|--------:|-------------:|------:|-----------------:|---------:|-------------:|
-| puzzles0_kaggle             |   100,000 | **892 ns** | 1109 ns | 1000 ns | 1.24x | 1.12x |
-| puzzles1_unbiased           | 1,000,000 | **2.268 us** | 2.814 | 2.533 | 1.24x | 1.12x |
-| puzzles2_17_clue            |    49,158 | **2.374 us** | 3.056 | 2.731 | 1.29x | 1.15x |
-| puzzles7_serg_benchmark     |    10,000 | **1.478 us** | 1.830 | 1.627 | 1.24x | 1.10x |
-| puzzles3_magictour_top1465  |     1,465 | **4.781 us** | 5.771 | 5.252 | 1.21x | 1.10x |
-| puzzles5_forum_hardest_11+  |    48,766 | **21.25 us** | 25.46 | 23.43 | 1.20x | 1.10x |
-| puzzles6_forum_hardest_1106 |       375 | **34.18 us** | 40.87 | 37.61 | 1.20x | 1.10x |
+| Corpus | puzzles | **fastdoku** | tdoku | tdoku+fastpath\* | vs tdoku | vs +fastpath |
+|--------|--------:|-------------:|------:|-----------------:|---------:|-------------:|
+| puzzles0_kaggle            |   100,000 | **892 ns**   | 1109 ns | 1000 ns | 1.24x | 1.12x |
+| puzzles1_unbiased          | 1,000,000 | **2.268 us** | 2.814   | 2.533   | 1.24x | 1.12x |
+| puzzles2_17_clue           |    49,158 | **2.374 us** | 3.056   | 2.731   | 1.29x | 1.15x |
+| puzzles7_serg_benchmark    |    10,000 | **1.478 us** | 1.830   | 1.627   | 1.24x | 1.10x |
+| puzzles3_magictour_top1465 |     1,465 | **4.781 us** | 5.771   | 5.252   | 1.21x | 1.10x |
+| puzzles5_forum_hardest_11+ |    48,766 | **21.25 us** | 25.46   | 23.43   | 1.20x | 1.10x |
+| puzzles6_forum_hardest_1106|       375 | **34.18 us** | 40.87   | 37.61   | 1.20x | 1.10x |
+| puzzles4_forum_hardest_1905| 2,135,371 | **18.90 us** | 21.29   | 19.55   | 1.13x | 1.03x |
 
-\* **tdoku+fastpath is tdoku with fastdoku's one structural optimization
-backported** (see below). It is not upstream tdoku; it exists to isolate how
-much of the win is that single change. Honest summary: **most of the 12-22%
-lead over stock tdoku is that one optimization**, which tdoku could adopt in
-a few lines. Against a tdoku that has it, the remaining edge is a real but
-modest **3-13%**.
+\* **`tdoku+fastpath` is tdoku with one of fastdoku's changes backported**
+(the hot/cold split described below), not upstream tdoku. It exists so the
+table shows how much of the lead comes from that single change — most of it.
+Against a tdoku that has it, the remaining margin is **1.10-1.15x** on seven
+corpora and 1.03x on the eighth.
 
-Multithreaded (embarrassingly parallel, 16 threads, full corpora):
+That eighth is worth a note: `puzzles4` is 2.1M puzzles, ~170 MB of input,
+and it is the one set large enough that the working set rather than the
+propagation loop sets the pace. Its near-twin `puzzles5` (the same forum
+collection filtered to rating 11+, 49k puzzles) is comparable in difficulty
+per puzzle and shows the usual 1.10x. Optimizations to the inner loop show up
+much less when the machine is fetching puzzles.
 
-| Dataset | puzzles | per puzzle | throughput |
-|---------|--------:|-----------:|-----------:|
-| puzzles0_kaggle             |   100,000 | 87 ns | 11.51M/s |
-| puzzles1_unbiased           | 1,000,000 | 186 ns | 5.37M/s |
-| puzzles2_17_clue            |    49,158 | 208 ns | 4.80M/s |
-| puzzles4_forum_hardest_1905 | 2,135,371 | 1.71 us | 586K/s |
+Multithreaded, 16 threads (solving is embarrassingly parallel):
 
-### Verification
+| Corpus | per puzzle | throughput |
+|--------|-----------:|-----------:|
+| puzzles0_kaggle            |  85 ns | 11.76M/s |
+| puzzles1_unbiased          | 197 ns |  5.07M/s |
+| puzzles2_17_clue           | 220 ns |  4.55M/s |
+| puzzles5_forum_hardest_11+ | 1.84 us |  543K/s |
 
-Solution checksums match tdoku's **exactly on all eight datasets** — over
-3.4 million puzzles, bit-identical grids. That includes
-`puzzles7_serg_benchmark`, which is composed entirely of puzzles with
-multiple solutions (`fastdoku check` reports 10,000/10,000 multiple): because
-this is the same algorithm with the same branching order, it selects the same
-solution tdoku does. Every returned grid is also validated cell-by-cell.
+**Verification:** solution checksums match tdoku's exactly on all eight
+corpora — 3.4M puzzles, bit-identical grids. That includes
+`puzzles7_serg_benchmark`, which is composed entirely of multi-solution
+puzzles (`fastdoku check` reports 10,000/10,000): same algorithm, same
+branching order, same solution chosen. Every returned grid is also validated
+cell by cell.
 
 ## Usage
 
 ```
-fastdoku solve <file|->            solve puzzles (81-char lines, . or 0 = blank)
-fastdoku check <file|->            classify: unique / multiple / unsolvable
+fastdoku solve <file|->    solve (81-char lines, . or 0 = blank, - reads stdin)
+fastdoku check <file|->    classify: unique / multiple / unsolvable
 fastdoku bench <file> [--rounds N] [--threads N] [--limit N] [--engine E]
-fastdoku gen <count> [--seed N]    generate random minimal unique puzzles
+fastdoku gen <count> [--seed N]    generate minimal unique puzzles
 ```
 
-Puzzles are one per line, 81 characters, `.` or `0` for blanks; `#` comment
-lines and blank lines are skipped, so tdoku's corpora and Norvig's lists work
-as-is. `-` reads stdin.
-
-### Building
+`#` comments and blank lines are skipped, so tdoku's corpora and Norvig's
+lists work as-is.
 
 ```bash
 cargo build --release
 ```
 
-No dependencies. `.cargo/config.toml` sets `-C target-cpu=native`, which
-enables the AVX2 `triad` engine; without AVX2 the build falls back to the
-portable scalar `band` engine automatically.
+No dependencies. `.cargo/config.toml` sets `-C target-cpu=native`, enabling
+the AVX2 engine; without AVX2 the build falls back to a portable scalar
+engine. On Windows `.\build.ps1` adds a two-stage PGO build (`-NoPgo` to
+skip).
 
-On Windows, `.\build.ps1` does a two-stage PGO build (worth 1.5-4%);
-`-NoPgo` skips it.
+To reproduce the comparison: clone tdoku, unzip its `data.zip`, then with
+clang on PATH run `.\bench\build_tdoku.ps1` and `.\bench\compare.ps1`. Set
+`TDOKU_DIR` if the checkout isn't at `C:\Claude\tdoku-ref`. Only the
+comparison needs clang and tdoku; the solver needs neither.
 
-### Reproducing the benchmarks
+## How it works
 
-```bash
-git clone https://github.com/t-dillon/tdoku      # then unzip its data.zip
-```
+Credit for the architecture belongs to tdoku. In brief:
 
-Then, with LLVM/clang on PATH, `.\bench\build_tdoku.ps1` builds the two
-reference binaries and `.\bench\compare.ps1` runs the three-way comparison.
-Set `TDOKU_DIR` if the checkout is not at `C:\Claude\tdoku-ref`.
+**A box is one 256-bit vector** — a 4x4 matrix of 9-bit candidate sets. The
+3x3 corner holds the box's cells; the right column and bottom row hold
+*negative triad* literals ("this digit is not in this minirow/minicol"). Two
+constraint families then fall out uniformly: exactly-one along each matrix
+row and column, and per-lane cardinality minimums (a cell keeps >= 1
+candidate; a negative triad keeps >= 6, because exactly 3 of 9 digits live in
+a triad). A lane at its minimum asserts everything remaining in it.
 
-Only the comparison needs clang and a tdoku checkout; the solver itself needs
-neither.
+**A band is a set of configurations.** For each digit there are only six ways
+its triads can sit in a band — the 3x3 permutation matrices — so a band is
+six lanes of 9-bit digit masks. Boxes and bands exchange elimination messages
+through byte-shuffle tables until mutual fixpoint.
 
-## Design
+**Branching is on (band, digit):** commit the lowest remaining configuration
+or rule it out, choosing the band with fewest configurations overall and a
+digit with fewest within it.
 
-The default `triad` engine is a Rust port of tdoku's `solver_dpll_triad_simd`
-(BSD-2-Clause; notice in [`src/triad.rs`](src/triad.rs)). Credit for the
-architecture belongs to Tom Dillon. The mechanism:
+`box_restrict` inlines into `band_eliminate` and the three box peers are
+unrolled, so one ~540-instruction function holds three copies of the
+propagation fixpoint loop; recursion re-enters it by call. Essentially all
+runtime is in that loop.
 
-- **Box state is one 256-bit vector.** Each box is a 4x4 matrix of 9-bit
-  candidate sets: the 3x3 corner is the box's cells, the right column and
-  bottom row hold *negative triad* literals ("this digit is not in this
-  minirow/minicol"). Two constraint families then fall out uniformly —
-  exactly-one along each matrix row/column, and per-lane cardinality minimums
-  (a cell keeps >= 1 candidate; a negative triad keeps >= 6, because exactly
-  3 of 9 digits live in a triad). Popcount equality with the minimum asserts
-  everything left in the lane.
-- **Band state is configurations, not triads.** For each digit there are only
-  6 ways its triads can sit in a band (the 3x3 permutation matrices), so a
-  band is 6 lanes of 9-bit digit masks. Boxes and bands exchange elimination
-  messages through byte-shuffle tables until mutual fixpoint.
-- **Branching is on (band, digit)**: commit the lowest remaining
-  configuration versus rule it out, choosing the band with fewest total
-  configurations and a digit with fewest configurations in it.
+## What's different from tdoku
 
-### The one thing that is not tdoku's
+Two of these are Windows ABI artifacts that would not help on Linux. The
+other two are scheduling changes that apply anywhere.
 
-Splitting each of `box_restrict` and `band_eliminate` into an always-inlined
-fast path (the early-return test, which is overwhelmingly the common case)
-and a `noinline` cold body. Under the Windows x64 ABI `xmm6`-`xmm15` are
-callee-saved, so the un-split functions execute a prologue spilling ten
-vector registers *before* discovering they have nothing to do. Backporting
-this to tdoku recovers most of its deficit, which is why it is broken out as
-its own column above. It is worth ~11% here and would be worth less on
-SysV (Linux/macOS), where no vector registers are callee-saved.
+### Hot/cold split of the propagation functions — ~11%, Windows-specific
 
-Three other measured wins:
+`box_restrict` and `band_eliminate` both begin with an early return that is
+taken on the overwhelming majority of calls (nothing to eliminate). Upstream
+they are single functions, so that early return still executes a prologue
+that spills `xmm6`-`xmm15` — callee-saved under the Windows x64 ABI — before
+discovering there is no work to do.
 
-- **`extern "sysv64"` on the recursive propagation function** (~2%). Windows
-  x64 makes `xmm6`-`xmm15` callee-saved, so every entry to a function that
-  uses the full vector file spills and reloads ten of them. SysV treats all
-  sixteen as volatile. This cut the prologue from 19 instructions (8 pushes,
-  a 248-byte frame, 10 vector spills) to 7, leaving only 2 genuine spills.
+Splitting each into an always-inlined test plus a `noinline` cold body means
+the common path never enters a frame. This is the single largest difference
+and it is why the results table carries a `tdoku+fastpath` column: it applies
+cleanly to tdoku's own source
+([`bench/tdoku_fastpath.cc`](bench/tdoku_fastpath.cc)) and recovers most of
+tdoku's deficit. On SysV targets, where no vector registers are callee-saved,
+the effect should be much smaller.
+
+### SysV calling convention for the recursive body — ~2%, Windows-specific
+
+Even split, the cold body uses the whole vector file and pays to preserve ten
+registers at every level of the propagation recursion. `extern "sysv64"`
+makes all sixteen volatile. The prologue drops from 19 instructions (8
+pushes, a 248-byte frame, 10 vector spills) to 7, leaving 2 genuine spills.
+A no-op on platforms where SysV is already the default.
+
+### Parallel column broadcast — 2-4%, applies anywhere
+
+This one is a real scheduling improvement, not an ABI quirk.
+
+Broadcasting an asserted digit across its column is a 4-way OR reduction.
+Written the obvious way — `x |= rot(x)` twice — it uses only two cross-lane
+permutes, but chains them: permute, or, permute, or. A cross-lane permute
+costs 3 cycles on Zen 3, so that path is 8 cycles. Issuing three *independent*
+permutes off the same source and combining them as a balanced tree is one
+more instruction and 5 cycles.
+
+The loop is latency-bound on its loop-carried dependency chain, not
+throughput-bound, so trading an instruction for three cycles wins. The gain
+scales with difficulty — largest on the hardest corpus, where the loop
+iterates most — which is the signature of a critical-path effect. Upstream
+tdoku uses the chained form.
+
+### Fused band elimination message — ~0.5%, applies anywhere
+
+Building the message from a box vector took shuffle + two `vextracti128` +
+or + `vinserti128` per value. But the high half already holds the vertical
+triads in the right positions, and of the three horizontal triads only one
+lives in the other 128-bit lane. A half-swap plus two in-lane shuffles
+reaches everything: 4 shuffle-port operations instead of 6.
+
+### Smaller
+
 - **Branchless clue scanning** at initialization: locate clue cells with
-  three `vpcmpeqb` + bit-scan rather than a per-cell branch (~5% on easy
-  puzzles).
-- **PGO** (1.5-4%).
+  three `vpcmpeqb` and a bit-scan rather than a per-cell branch (~5% on easy
+  puzzles, where init dominates).
+- **The box is carried in a register** across fixpoint iterations and written
+  back once on exit; the intermediate stores were dead.
+- **PGO** by default on Windows (1.5-4%).
 
-### Scheduling the propagation loop
+## What didn't work
 
-Disassembling the fixpoint loop and working through it instruction by
-instruction produced one more win, and it is the opposite of what counting
-instructions suggests. The loop is **latency bound on its loop-carried
-dependency chain**, not throughput bound, so the payoff is in shortening that
-chain even at the cost of extra work:
+Recorded because each looks like an obvious win, and three of them are the
+kind of thing instruction-counting recommends. Measured against a ±0.3%
+run-to-run noise floor.
 
-- **Broadcasting an assertion across its column** was a running `x |= rot(x)`
-  reduction: two cross-lane permutes, but chained as permute, or, permute, or
-  — 8 cycles, because a cross-lane permute costs 3. Issuing three independent
-  permutes off the same source and OR-ing them as a tree is one *more*
-  instruction and 5 cycles. **Worth 2-4%**, and most on the hardest puzzles,
-  where the loop iterates more.
-- The same treatment on the row direction, where in-lane rotations cost 1
-  cycle instead of 3, is worth almost nothing — kept, but it is noise.
-- **Building the band elimination message** used shuffle + two
-  `vextracti128` + or + `vinserti128` per value. The high half already holds
-  the vertical triads in the right places, and only one of the three
-  horizontal triads lives in the other 128-bit lane, so a half-swap plus two
-  in-lane shuffles reaches everything: 4 shuffle-port ops instead of 6.
-  Worth ~0.5%.
-
-Three measured *losses*, all recorded because they look like obvious wins:
-
-- Rewriting the contradiction check from `movemask`+`cmp` to the shorter
-  `vptest` form removed an instruction and ran **~1% slower**. The loop is
-  vector-port bound for throughput; moving the test to the integer ports is
-  worth more than the instruction it costs.
-- Building `two_or_more` as a balanced tree rather than a running
-  accumulation is one level shallower for identical op count, but keeps three
-  rotations and four partials live at once. It pushed the loop from 77 to 81
-  instructions through rematerialization and ran **~0.7% slower**.
-- Pinning the popcount nibble table in a register with inline `asm!` (to stop
-  it being re-broadcast every iteration) worked — the `vbroadcasti128` left
-  the loop — but spending one of sixteen vector registers cost three
-  instructions elsewhere, for **no measurable change**. The broadcast issues
-  on the load port, which this loop has to spare. LLVM's choice was correct.
-
-The pattern: instructions that sit on an idle port are free, and the compiler
-already knows it. The loop ends up at 80 instructions — two *more* than
-before this pass — and 3.5% faster.
-
-### Other engines
-
-Three earlier engines are kept, selectable via `--engine`, because four
-independent implementations cross-validating each other is what makes
-aggressive unsafe optimization survivable:
-
-- **`band`** — bitboards per digit and horizontal band; exact
-  permutation-support reduction by table lookup; lazy column inference; AVX2
-  in the assignment hot loop. The fastest of the pre-port engines and the
-  portable fallback when AVX2 is unavailable.
-- **`simd`** — dual-orientation bitboards, each digit's board held twice in
-  one register. Correct, cross-validated, and slower.
-- **`baseline`** — classic 9-bit cell masks with 20-peer elimination.
-
-## Engineering log
-
-The path here was not monotonic, and the rejected experiments are as
-informative as the accepted ones. Measured on magictour / kaggle:
-
-| Engine | magictour | kaggle |
+| Change | Expected | Measured |
 |---|---|---|
-| `baseline` (cell masks, hidden singles, MRV) | ~29 us\* | — |
-| `band` (bitboards + permutation-support tables) | 11.97 | 2.02 |
-| `band` + AVX2 assign hot path | 13.05† | 1.94 |
-| `simd` (dual-orientation vector state) | 16.04 | 3.35 |
-| `triad` (ported architecture) | 5.96 | 1.39 |
-| `triad` + hot/cold split | 5.14 | 0.96 |
-| `triad` + branchless init + PGO | **5.06** | **0.92** |
+| `vptest` instead of `movemask`+`cmp` for the contradiction check | −1 instruction | **~1% slower** — the loop is vector-port bound for throughput; `movemask` hands the test to idle integer ports |
+| Balanced tree for `two_or_more` instead of running accumulation | 1 level shallower, same op count | **~0.7% slower** — keeps 3 rotations and 4 partials live, forcing rematerialization; loop grew 77→81 instructions |
+| Pinning the popcount nibble table in a register via inline `asm!` | −1 instruction per iteration | **no change** — it did evict the `vbroadcasti128`, but spending 1 of 16 vector registers cost 3 instructions elsewhere. The broadcast issues on the load port, which this loop has to spare. LLVM was right |
+| Sinking the dead per-iteration box store | −1 store per iteration | **no change** — store port is idle too. Kept anyway; the code is simpler |
 
-\* on the older top95 set. † magictour absorbed a regression from
-restructuring the stall pass; kaggle and unbiased improved.
+The pattern: an instruction sitting on an idle port is free, and the compiler
+already knows it. After this pass the loop is **80 instructions — two more
+than before — and 3.5% faster**.
 
-Rejected by measurement — each looked good on paper:
-
-- **Cross-digit cardinality inference.** A band's 9 minirows hold exactly 3
-  digits each, constraining the digit-by-minirow incidence matrix by column
-  as well as row. Shrinks the tree (magictour 21.3 -> 16.9 guesses/puzzle)
-  but the scan costs more than the nodes it saves, scalar *and* vectorised.
-- **Full dual-orientation SIMD state.** Removes all transposition, but a
-  propagation event dirties one of six lanes, so filling the vector does 6x
-  the work; `vpgatherdd` is also slow on Zen 3.
-- **Configuration branching in the `band` engine** — the right idea in the
-  wrong representation. It only pays once triads make it cheap, which is
-  exactly what the port provides.
-- **Naked pairs** (cut guesses 21 -> 13 on top95, still a net loss),
-  **box hidden singles** (found nothing the other scans missed), and
-  **`panic=abort`** (LLVM had already proven the hot paths nounwind).
-
-The through-line: at ~0.5 us per search node, extra inference must be nearly
-free to pay for itself, and vector width only helps where all nine digits are
-genuinely involved. That is precisely what the triad representation achieves
-and what the earlier engines could not.
+Earlier, before the port to tdoku's architecture, three original designs were
+built and measured: bitboards per digit and band with a permutation-support
+table, a dual-orientation variant holding each digit's board twice in one
+register, and a classic cell-mask solver. All three are slower than the port
+and all three survive as `--engine band|simd|baseline`. Cross-digit
+cardinality inference, naked pairs, box hidden singles, and branching on band
+configurations were tried in those engines and lost on cost.
 
 ## Correctness
 
 - `cargo test` cross-validates all four engines against each other on
-  hundreds of random puzzles — valid, minimal, over-clued, contradictory, and
+  hundreds of random puzzles — valid, minimal, over-clued, contradictory and
   multi-solution — asserting identical solution counts and validating every
-  returned grid. It also proves the 512-entry permutation-support table
-  agrees with an independently written iterative reduction on all inputs.
+  grid returned.
 - `bench` verifies every solution and asserts identical checksums across
-  rounds, threads, and engines.
-- Checksums match tdoku exactly on 3.4M+ benchmark puzzles.
+  rounds, threads and engines.
+- Checksums match tdoku bit-for-bit on 3.4M benchmark puzzles.
+
+Four independent implementations agreeing is what makes the unsafe SIMD code
+maintainable; any change that breaks one engine's semantics gets caught.
 
 ## Credits and license
 
-The `triad` engine's architecture, tables, and update rules are **tdoku's**,
-by Tom Dillon — https://github.com/t-dillon/tdoku. Credit for the design
-belongs to him; this repository contributes a Rust port, the hot/cold split
-described above, and the head-to-head harness.
-
-Derived files, both carrying the upstream notice:
+The architecture, tables and update rules are **tdoku's**, by Tom Dillon —
+https://github.com/t-dillon/tdoku. This repository contributes a Rust port,
+the changes above, and the head-to-head harness.
 
 | File | Relationship to tdoku |
 |---|---|
 | `src/triad.rs` | Rust port of `src/solver_dpll_triad_simd.cc` |
 | `bench/tdoku_fastpath.cc` | Modified copy of that file (hot/cold split only) |
 
-Licensed **BSD-2-Clause**, matching upstream so the derivation stays clean —
-see [LICENSE](LICENSE) for terms and [NOTICE](NOTICE) for exactly what is
-derived from where.
+BSD-2-Clause, matching upstream so the derivation stays clean — see
+[LICENSE](LICENSE) for terms and [NOTICE](NOTICE) for what derives from
+where.
 
-Benchmark corpora are tdoku's and are not redistributed here. `data/` holds
-Peter Norvig's top95/hardest lists (norvig.com) plus generated minimal
-puzzles, so the tests and a `-NoPgo`-free build work standalone.
+Benchmark corpora belong to tdoku and are not redistributed here. `data/`
+holds Peter Norvig's top95/hardest lists and generated minimal puzzles so the
+tests and a non-PGO build work standalone.
