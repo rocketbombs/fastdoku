@@ -1,18 +1,8 @@
 BSD 2-Clause License
 
+Copyright (c) 2019, Tom Dillon
 Copyright (c) 2026, rocketbombs
 All rights reserved.
-
-Portions of this software are derived from tdoku:
-
-    Copyright (c) 2019, Tom Dillon
-    https://github.com/t-dillon/tdoku
-    All rights reserved.
-
-  Specifically, `src/triad.rs` is a Rust port of tdoku's
-  `src/solver_dpll_triad_simd.cc`, and `bench/tdoku_fastpath.cc` is a
-  modified copy of that same file. Both retain this notice. tdoku is
-  distributed under the same BSD 2-Clause License reproduced below.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

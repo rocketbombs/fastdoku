@@ -215,8 +215,8 @@ Derived files, both carrying the upstream notice:
 | `bench/tdoku_fastpath.cc` | Modified copy of that file (hot/cold split only) |
 
 Licensed **BSD-2-Clause**, matching upstream so the derivation stays clean —
-see [LICENSE](LICENSE). Copyright for the original portions is
-`Copyright (c) 2019, Tom Dillon`.
+see [LICENSE](LICENSE) for terms and [NOTICE](NOTICE) for exactly what is
+derived from where.
 
 Benchmark corpora are tdoku's and are not redistributed here. `data/` holds
 Peter Norvig's top95/hardest lists (norvig.com) plus generated minimal
