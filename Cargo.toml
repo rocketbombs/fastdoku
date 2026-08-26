@@ -1,0 +1,27 @@
+[package]
+name = "fastdoku"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+description = "A very fast, complete sudoku solver."
+repository = "https://github.com/rocketbombs/fastdoku"
+
+[features]
+# Counts branch decisions; adds an atomic to the hot path, so benchmark
+# timings should be taken without it.
+stats = []
+
+# No runtime dependencies. The reference solver it is benchmarked against is
+# built separately by bench/build_tdoku.ps1 from a tdoku checkout.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Benchmark profile: release plus panic=abort (no unwind landing pads in the
+# recursive hot paths). Kept separate because `cargo test` needs unwinding.
+[profile.fast]
+inherits = "release"
+panic = "abort"

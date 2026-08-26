@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Benchmark build outputs (tdoku objects/binaries, built locally)
+/bench/out
+
+# Profile-guided optimization data
+*.profraw
+*.profdata
