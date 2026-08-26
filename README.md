@@ -8,6 +8,11 @@ SIMD architecture — the design is Tom Dillon's — plus a set of scheduling an
 ABI changes that make it faster than tdoku on every one of tdoku's own
 benchmark corpora.
 
+**It is not the fastest solver in every regime.** On hard puzzles it leads
+the field; on easy and typical ones
+[rust_sudoku](https://github.com/Emerentius/sudoku) is meaningfully faster.
+Both are measured below.
+
 ## Results
 
 Same machine, same data, same harness. tdoku is built from source here and
@@ -20,16 +25,33 @@ vector, same best-of-N protocol, same solution checksum. Both are built
 Ryzen 7 5700X (Zen 3, 8C/16T, AVX2, no AVX-512), Windows 11, rustc 1.98 /
 clang 22. Single thread, best-of-N, full corpora, time to first solution.
 
-| Corpus | puzzles | **fastdoku** | tdoku | tdoku+fastpath\* | vs tdoku | vs +fastpath |
-|--------|--------:|-------------:|------:|-----------------:|---------:|-------------:|
-| puzzles0_kaggle            |   100,000 | **892 ns**   | 1109 ns | 1000 ns | 1.24x | 1.12x |
-| puzzles1_unbiased          | 1,000,000 | **2.268 us** | 2.814   | 2.533   | 1.24x | 1.12x |
-| puzzles2_17_clue           |    49,158 | **2.374 us** | 3.056   | 2.731   | 1.29x | 1.15x |
-| puzzles7_serg_benchmark    |    10,000 | **1.478 us** | 1.830   | 1.627   | 1.24x | 1.10x |
-| puzzles3_magictour_top1465 |     1,465 | **4.781 us** | 5.771   | 5.252   | 1.21x | 1.10x |
-| puzzles5_forum_hardest_11+ |    48,766 | **21.25 us** | 25.46   | 23.43   | 1.20x | 1.10x |
-| puzzles6_forum_hardest_1106|       375 | **34.18 us** | 40.87   | 37.61   | 1.20x | 1.10x |
-| puzzles4_forum_hardest_1905| 2,135,371 | **18.90 us** | 21.29   | 19.55   | 1.13x | 1.03x |
+Corpora are ordered easy to hard. Bold marks the fastest of the four.
+
+| Corpus | puzzles | fastdoku | tdoku | tdoku+fastpath\* | rust_sudoku |
+|--------|--------:|---------:|------:|-----------------:|------------:|
+| puzzles0_kaggle            |   100,000 | 892 ns   | 1109 ns | 1000 ns | **826 ns** |
+| puzzles7_serg_benchmark    |    10,000 | 1.478 us | 1.830   | 1.627   | **1.459**  |
+| puzzles1_unbiased          | 1,000,000 | 2.268 us | 2.814   | 2.533   | **1.579**  |
+| puzzles2_17_clue           |    49,158 | 2.374 us | 3.056   | 2.731   | **1.670**  |
+| puzzles3_magictour_top1465 |     1,465 | **4.781 us** | 5.771 | 5.252 | 5.355 |
+| puzzles4_forum_hardest_1905| 2,135,371 | **18.90 us** | 21.29 | 19.55 | 21.38 |
+| puzzles5_forum_hardest_11+ |    48,766 | **21.25 us** | 25.46 | 23.43 | 25.84 |
+| puzzles6_forum_hardest_1106|       375 | 34.18 us | 40.87   | 37.61   | **31.67**  |
+
+**Against tdoku:** faster on all eight, by 1.13-1.29x against upstream and
+1.03-1.15x against the fastpath build.
+
+**Against the field:** fastdoku leads on the three large hard corpora — the
+regime tdoku's architecture targets — by 1.11-1.22x over rust_sudoku. It
+trails on easy and typical puzzles, by up to 1.44x on `unbiased`, and on the
+375-puzzle extreme set. tdoku's own README anticipates this: "for easy
+minimal puzzles ... Rust Sudoku tends to be either fastest or on par with the
+fastest."
+
+So the accurate claim is *fastest known solver on hard puzzles*, not fastest
+overall. Closing the easy-puzzle gap is the obvious open problem: rust_sudoku
+is a JCZSolve derivative, so the two architectures trade wins by regime
+rather than one dominating.
 
 \* **`tdoku+fastpath` is tdoku with one of fastdoku's changes backported**
 (the hot/cold split described below), not upstream tdoku. It exists so the
@@ -53,8 +75,16 @@ Multithreaded, 16 threads (solving is embarrassingly parallel):
 | puzzles2_17_clue           | 220 ns |  4.55M/s |
 | puzzles5_forum_hardest_11+ | 1.84 us |  543K/s |
 
+rust_sudoku is measured with the same protocol by
+[`bench/rust_sudoku_bench.rs`](bench/rust_sudoku_bench.rs), built as a
+standalone crate: it is AGPL, so it is not a dependency of this one.
+Infandoku was also measured (correct, checksums match) at 2.1 us / 15.6 us /
+66.3 us on kaggle / 17-clue / magictour — 1.9x to 11.5x behind tdoku, despite
+an upstream issue claiming a 2.2x win over it.
+
 **Verification:** solution checksums match tdoku's exactly on all eight
-corpora — 3.4M puzzles, bit-identical grids. That includes
+corpora — 3.4M puzzles, bit-identical grids. rust_sudoku and Infandoku agree
+on every uniquely-solvable corpus too. That includes
 `puzzles7_serg_benchmark`, which is composed entirely of multi-solution
 puzzles (`fastdoku check` reports 10,000/10,000): same algorithm, same
 branching order, same solution chosen. Every returned grid is also validated
