@@ -54,6 +54,59 @@ fn checksum(sol: &[u8; 81]) -> u64 {
 
 type SolveFn = fn(&[u8; 81]) -> Option<[u8; 81]>;
 
+/// Default engine: route each puzzle between the scalar `jcz` engine (the
+/// cheapest per easy deduction) and the `triad` engine (the strongest
+/// inference). jcz propagates to its fixpoint — useful work regardless of
+/// which engine finishes — and defers at its first guess point if the puzzle
+/// is still far from solved, or later if its guess budget trips. This
+/// dispatch lives in the binary rather than the library: compiled next to
+/// the triad hot path it perturbs that engine's LTO codegen by ~12% on the
+/// hard corpora.
+fn auto_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        match fastdoku::jcz::run(
+            clues,
+            1,
+            fastdoku::HYBRID_MAX_UNSOLVED,
+            fastdoku::HYBRID_GUESS_BUDGET,
+        ) {
+            fastdoku::jcz::Outcome::Done(n, sol) => {
+                if n > 0 {
+                    sol
+                } else {
+                    None
+                }
+            }
+            fastdoku::jcz::Outcome::Deferred => triad_solve_grid(clues),
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        jcz_solve_grid(clues)
+    }
+}
+
+/// `auto` for solution counting; see `auto_solve_grid`.
+fn auto_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        match fastdoku::jcz::run(
+            clues,
+            limit,
+            fastdoku::HYBRID_MAX_UNSOLVED,
+            fastdoku::HYBRID_GUESS_BUDGET,
+        ) {
+            fastdoku::jcz::Outcome::Done(n, _) => n,
+            fastdoku::jcz::Outcome::Deferred => triad_count_solutions(clues, limit),
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        jcz_count_solutions(clues, limit)
+    }
+}
+
 fn solve_batch(puzzles: &[[u8; 81]], f: SolveFn) -> (u64, usize) {
     let mut sum = 0u64;
     let mut solved = 0usize;
@@ -84,7 +137,7 @@ fn cmd_solve(file: &str) {
     let puzzles = read_puzzles(file);
     let t = Instant::now();
     for p in &puzzles {
-        match solve_grid(p) {
+        match auto_solve_grid(p) {
             Some(s) => println!("{}", grid_to_line(&s)),
             None => println!("NO SOLUTION"),
         }
@@ -101,13 +154,13 @@ fn cmd_check(file: &str) {
     let puzzles = read_puzzles(file);
     let (mut none, mut unique, mut multi) = (0usize, 0usize, 0usize);
     for (i, p) in puzzles.iter().enumerate() {
-        match count_solutions(p, 2) {
+        match auto_count_solutions(p, 2) {
             0 => {
                 none += 1;
                 println!("line {}: NO SOLUTION", i + 1);
             }
             1 => {
-                let s = solve_grid(p).unwrap();
+                let s = auto_solve_grid(p).unwrap();
                 assert!(is_valid_solution(&s, p), "line {}: invalid solution!", i + 1);
                 unique += 1;
             }
@@ -124,9 +177,12 @@ fn cmd_bench(file: &str, rounds: usize, threads: usize, engine: &str, limit: usi
     let f: SolveFn = match engine {
         "baseline" => baseline_solve_grid,
         "band" => band_solve_grid,
+        "jcz" => jcz_solve_grid,
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         "simd" => simd_solve_grid,
-        _ => solve_grid,
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        "triad" => triad_solve_grid,
+        _ => auto_solve_grid,
     };
     let mut puzzles = read_puzzles(file);
     puzzles.truncate(limit);
@@ -202,7 +258,7 @@ fn cmd_gen(count: usize, seed: u64) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage:\n  fastdoku solve <file|->\n  fastdoku check <file|->\n  fastdoku bench <file> [--rounds N] [--threads N]\n  fastdoku gen <count> [--seed N]";
+    let usage = "usage:\n  fastdoku solve <file|->\n  fastdoku check <file|->\n  fastdoku bench <file> [--rounds N] [--threads N] [--limit N] [--engine auto|jcz|triad|band|simd|baseline]\n  fastdoku gen <count> [--seed N]";
     if args.len() < 2 {
         eprintln!("{usage}");
         std::process::exit(2);
@@ -223,7 +279,7 @@ fn main() {
                 .position(|a| a == "--engine")
                 .and_then(|i| args.get(i + 1))
                 .map(|s| s.as_str())
-                .unwrap_or(if fastdoku::HAS_SIMD { "triad" } else { "band" })
+                .unwrap_or("auto")
                 .to_string();
             cmd_bench(
                 &args[2],

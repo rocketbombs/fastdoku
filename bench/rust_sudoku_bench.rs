@@ -1,20 +1,21 @@
-﻿// Benchmarks rust_sudoku (the sudoku crate by Emerentius, a JCZSolve
-// derivative and the strongest solver in this comparison on easy puzzles)
-// using the identical protocol to fastdoku's ench and tdoku_bench.cc:
-// same parsing, same in-memory vector, same best-of-N, same checksum, and
-// the puzzle handed over inside the timed region.
+﻿// Benchmarks rust_sudoku (the `sudoku` crate by Emerentius, a JCZSolve
+// derivative; "rust_sudoku" in tdoku's suite) using the identical protocol
+// to fastdoku's `bench` and bench/tdoku_bench.cc: same parsing, same
+// in-memory vector, same best-of-N, same checksum, and the puzzle handed
+// over inside the timed region.
 //
 // NOT part of this crate: the sudoku crate is AGPL, so it is kept out of
-// fastdoku's dependency graph. To run it, build it standalone:
+// fastdoku's dependency graph and none of its code is used in fastdoku.
+// To run it, build it standalone:
 //
 //   cargo new --bin rsbench && cd rsbench
 //   cargo add sudoku@0.8
 //   # copy this file over src/main.rs, then:
 //   RUSTFLAGS="-Ctarget-cpu=native" cargo build --release
 //   ./target/release/rsbench <puzzle-file> --rounds 3
-// Benchmarks the `sudoku` crate (Emerentius, "rust_sudoku" in tdoku's suite,
-// AGPL) using the same protocol as fastdoku's `bench` and bench/tdoku_bench.cc:
-// same parsing, same in-memory vector, same best-of-N, same checksum.
+//
+// For optimization parity, give the rsbench profile lto = "fat" and
+// codegen-units = 1 (fastdoku's own numbers use both).
 
 use std::time::Instant;
 

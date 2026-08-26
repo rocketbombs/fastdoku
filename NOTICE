@@ -33,6 +33,19 @@ Both files carry the upstream copyright notice and BSD 2-Clause terms.
 
 This project is licensed under the same BSD 2-Clause License; see LICENSE.
 
+Other acknowledged designs
+--------------------------
+
+  src/jcz.rs
+      An original implementation of the JCZSolve architecture -- bands
+      stored by digit with locked-candidate propagation through small
+      lookup tables -- as published on the enjoysudoku forum by
+      zhouyundong_2012, with refinements by champagne and JasonLion. No
+      existing implementation's code was used: the file is written from the
+      algorithm's published description, and its tables are derived from
+      first principles (and verified exhaustively in its tests). The
+      algorithmic credit belongs to those authors.
+
 Other data
 ----------
 

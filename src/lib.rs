@@ -1,17 +1,24 @@
 //! fastdoku — a fast, complete sudoku solver.
 //!
-//! Design notes (informed by tdoku / JCZSolve literature):
-//! - State is 9-bit candidate masks per cell plus per-unit solved-digit masks;
-//!   the whole search state is ~250 bytes, so a guess clones it (one memcpy)
-//!   instead of maintaining an undo trail.
-//! - Propagation runs naked singles (queue-driven peer elimination) and hidden
-//!   singles (a branch-free once/more bit scan over all 27 units) to fixpoint.
-//! - Branching picks a most-constrained cell (fewest candidates, early-out at
-//!   2), which the literature reports as a ~25x win on hard puzzles.
-//! - The same search counts solutions with a limit, so uniqueness checking and
-//!   "solve any valid sudoku" completeness fall out of one code path.
+//! Five engines, cross-validated against each other in the test suite:
+//! - `triad`: a port of tdoku's DPLL + triad + SIMD architecture (AVX2);
+//!   the strongest inference, fastest on hard puzzles.
+//! - `jcz`: an original implementation of the JCZSolve architecture (bands
+//!   by digit, locked candidates by table lookup); the cheapest per easy
+//!   deduction, fastest on easy and typical puzzles. Scalar, portable.
+//! - `band`, `simd`, `baseline`: earlier designs, kept selectable for
+//!   benchmarking and as independent implementations for cross-validation.
+//!
+//! The CLI's default `auto` engine routes each puzzle between `jcz` and
+//! `triad` using `jcz::run`'s difficulty gate (see that function). Common
+//! design notes: search state is small and copied per guess (no undo
+//! trail), propagation runs to fixpoint before every branch, and the same
+//! search counts solutions to a limit, so uniqueness checking and "solve
+//! any valid sudoku" completeness fall out of one code path.
 
 pub mod band;
+
+pub mod jcz;
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub mod simd;
@@ -567,11 +574,23 @@ fn load(st: &mut State, q: &mut Queue, clues: &[u8; 81]) -> bool {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Recommended difficulty gate for a jcz -> triad hybrid: a puzzle still
+/// this many cells from solved when jcz's propagation stalls belongs to the
+/// triad engine. Tuned on the benchmark corpora; see README.
+pub const HYBRID_MAX_UNSOLVED: u32 = 50;
+/// Recommended guess budget for the hybrid: a safety valve for puzzles that
+/// pass the gate but search deep anyway.
+pub const HYBRID_GUESS_BUDGET: u32 = 16;
+
 /// Solve a puzzle given as 81 digits (0 = blank). Returns the first solution
 /// found, or `None` if the puzzle has no solution.
 ///
 /// With AVX2 this is the `triad` engine (a port of tdoku's architecture);
-/// otherwise the scalar `band` engine.
+/// otherwise the scalar `band` engine. The CLI's default `auto` engine
+/// instead routes each puzzle between `jcz` and `triad` with
+/// [`jcz::run`] — that dispatch lives in the binary because defining it
+/// here, in the same LTO unit as the triad hot path, measurably degrades
+/// the triad engine's codegen (~12% on the hard corpora).
 #[inline]
 pub fn solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -595,6 +614,17 @@ pub fn count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
     {
         band::count_solutions(clues, limit)
     }
+}
+
+/// Scalar JCZSolve-family engine (bands by digit, locked candidates).
+#[inline]
+pub fn jcz_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
+    jcz::solve_grid(clues)
+}
+
+#[inline]
+pub fn jcz_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
+    jcz::count_solutions(clues, limit)
 }
 
 #[inline]
@@ -849,6 +879,12 @@ mod tests {
         let c_base = baseline_count_solutions(p, 2);
         let c_band = band_count_solutions(p, 2);
         assert_eq!(c_base, c_band, "band count differs on {}", grid_to_line(p));
+        assert_eq!(
+            c_base,
+            jcz_count_solutions(p, 2),
+            "jcz count differs on {}",
+            grid_to_line(p)
+        );
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         assert_eq!(
             c_base,
@@ -872,6 +908,7 @@ mod tests {
             for (name, sol) in [
                 ("baseline", baseline_solve_grid(p)),
                 ("band", band_solve_grid(p)),
+                ("jcz", jcz_solve_grid(p)),
             ] {
                 let s = sol.unwrap_or_else(|| panic!("{name} found no solution"));
                 assert!(is_valid_solution(&s, p), "{name} returned an invalid grid");

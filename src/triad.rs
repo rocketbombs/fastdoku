@@ -180,10 +180,6 @@ impl C16 {
         _mm256_testc_si256(o.0, self.0) != 0
     }
     #[inline(always)]
-    unsafe fn intersects(self, o: C16) -> bool {
-        _mm256_testz_si256(self.0, o.0) == 0
-    }
-    #[inline(always)]
     unsafe fn which_equal(self, o: C16) -> C16 {
         C16(_mm256_cmpeq_epi16(self.0, o.0))
     }
@@ -468,6 +464,9 @@ struct TState {
     /// bands[0] horizontal, bands[1] vertical.
     bands: [[Band; 2]; 3],
     boxen: [C16; 9],
+    /// Literals each box has already asserted and drawn the consequences of.
+    /// Grows monotonically within a search node; the branch copy restores it.
+    asserted: [C16; 9],
 }
 
 impl TState {
@@ -477,6 +476,7 @@ impl TState {
         TState {
             bands: [[Band { configurations: c8(&init), eliminations: C8::zero() }; 2]; 3],
             boxen: [C16::all(ALL); 9],
+            asserted: [C16::all(0); 9],
         }
     }
 
@@ -630,11 +630,34 @@ unsafe fn box_restrict<const FROM_VERTICAL: usize>(
     box_restrict_full::<FROM_VERTICAL>(state, box_idx, candidates)
 }
 
+/// `inline(always)`: the design keeps three copies of the fixpoint loop
+/// inlined inside each `band_eliminate_full` instantiation; without the
+/// attribute the inlining is at the mercy of module-wide heuristics, and
+/// adding the jcz engine to the crate was enough to flip LLVM into
+/// outlining this (measured ~7-10% slower on the hard corpora).
+#[inline(always)]
 unsafe fn box_restrict_full<const FROM_VERTICAL: usize>(
     state: &mut TState,
     box_idx: usize,
     candidates: C16,
 ) -> bool {
+    if !box_fixpoint(state, box_idx, candidates) {
+        return false;
+    }
+    let box_i = *DIV3.get_unchecked(box_idx);
+    let box_j = *MOD3.get_unchecked(box_idx);
+    // Forward to band peers, visiting the opposite orientation first.
+    if FROM_VERTICAL != 0 {
+        band_eliminate::<0>(state, box_i, box_j) && band_eliminate::<1>(state, box_j, box_i)
+    } else {
+        band_eliminate::<1>(state, box_j, box_i) && band_eliminate::<0>(state, box_i, box_j)
+    }
+}
+
+/// Restrict a box and run its internal clauses to fixpoint, leaving the
+/// resulting messages queued on its two bands but not delivering them.
+#[inline(always)]
+unsafe fn box_fixpoint(state: &mut TState, box_idx: usize, candidates: C16) -> bool {
     // SAFETY: box_idx < 9 (from BOX_PEERS), so DIV3/MOD3/boxen indexing is in
     // bounds; box_i/box_j < 3 index the bands array.
     let mut eliminating = state.boxen.get_unchecked(box_idx).and_not(candidates);
@@ -647,6 +670,7 @@ unsafe fn box_restrict_full<const FROM_VERTICAL: usize>(
     // exit. Nothing inside the loop reads it, and on the contradiction exit
     // the caller discards this state, so the intermediate stores were dead.
     let mut cells = *state.boxen.get_unchecked(box_idx);
+    let mut asserted = *state.asserted.get_unchecked(box_idx);
     loop {
         cells = cells.and_not(eliminating);
         let counts = cells.popcounts9();
@@ -672,6 +696,30 @@ unsafe fn box_restrict_full<const FROM_VERTICAL: usize>(
             assertions,
         );
 
+        // Loop exit. Everything downstream -- the box's own elimination
+        // closure and both band messages -- is a function of `assertions`
+        // alone, and each of those functions distributes over union, so an
+        // iteration that asserts nothing new can only re-derive consequences
+        // already accumulated. Testing that instead of testing whether
+        // `eliminating` grew moves the exit *above* the closure, so the
+        // terminating iteration skips it: about 40 of the loop's 80
+        // instructions, on 70% of iterations.
+        //
+        // It is the weaker test -- assertions can grow while every consequence
+        // is already eliminated -- which costs an extra iteration in that case
+        // and reaches the same fixpoint. Keeping both tests measured worse
+        // than either alone: the second branch costs more than the iteration.
+        //
+        // `assertions` only grows within a search node: a lane at its minimum
+        // either keeps its contents or falls below the minimum, and the
+        // cardinality check above rejects the latter first. So the subset test
+        // is an equality test, and carrying the previous value per box is what
+        // lets a re-entered box (~2.5 entries per easy puzzle) exit at once.
+        if assertions.subset_of(asserted) {
+            break;
+        }
+        asserted = assertions;
+
         // The band elimination accumulators are one register each; copy out,
         // update, copy back.
         let mut h_elims = state.bands.get_unchecked(box_i).get_unchecked(0).eliminations;
@@ -686,20 +734,17 @@ unsafe fn box_restrict_full<const FROM_VERTICAL: usize>(
         );
         state.bands.get_unchecked_mut(box_i).get_unchecked_mut(0).eliminations = h_elims;
         state.bands.get_unchecked_mut(box_j).get_unchecked_mut(1).eliminations = v_elims;
-
-        // Test the value already in hand rather than re-reading the box.
-        if !eliminating.intersects(cells) {
-            break;
-        }
     }
     *state.boxen.get_unchecked_mut(box_idx) = cells;
+    *state.asserted.get_unchecked_mut(box_idx) = asserted;
+    true
+}
 
-    // Forward to band peers, visiting the opposite orientation first.
-    if FROM_VERTICAL != 0 {
-        band_eliminate::<0>(state, box_i, box_j) && band_eliminate::<1>(state, box_j, box_i)
-    } else {
-        band_eliminate::<1>(state, box_j, box_i) && band_eliminate::<0>(state, box_i, box_j)
-    }
+/// One box's fixpoint, out of line, for the initialization pass: nine copies
+/// of the inlined loop would be a lot of code for a path taken once.
+#[inline(never)]
+unsafe fn seed_box_assertions(state: &mut TState, box_idx: usize) -> bool {
+    box_fixpoint(state, box_idx, C16::all(ALL))
 }
 
 /// Fast-path wrapper: a band with no pending eliminations intersecting its
@@ -757,29 +802,60 @@ unsafe extern "sysv64" fn band_eliminate_full<const VERTICAL: usize>(
     let triads = configurations_to_positive_triads(band.configurations);
 
     // Send box restriction messages, returning to the inbound peer last.
-    // SAFETY: from_peer < 3 and band_idx < 3 at every call site.
-    let peer = [
-        *MOD3.get_unchecked(from_peer + 1),
-        *MOD3.get_unchecked(from_peer + 2),
-        from_peer,
-    ];
+    // SAFETY: from_peer < 3 at every call site.
+    match from_peer {
+        0 => band_forward::<VERTICAL, 0>(state, band_idx, triads),
+        1 => band_forward::<VERTICAL, 1>(state, band_idx, triads),
+        _ => band_forward::<VERTICAL, 2>(state, band_idx, triads),
+    }
+}
+
+/// Forward a band's restriction messages to its three box peers, visiting the
+/// inbound peer (`FROM`) last.
+///
+/// `FROM` is a const parameter rather than a value because the visit order is
+/// a runtime permutation of three vectors: with a value the compiler has to
+/// spill all three to the stack and reload through a variable index, putting a
+/// store-forwarding stall on the critical path of every call. Specializing
+/// turns the selection into compile-time register naming.
+#[inline(always)]
+unsafe fn band_forward<const VERTICAL: usize, const FROM: usize>(
+    state: &mut TState,
+    band_idx: usize,
+    triads: C16,
+) -> bool {
+    // SAFETY: band_idx < 3 at every call site; FROM < 3 by construction.
     let box_peers = BOX_PEERS.get_unchecked(VERTICAL).get_unchecked(band_idx);
-    let peer_triads = [triads.get_lo(), triads.get_lo().rotate_cols(), triads.get_hi()];
-    // Unrolled: a 3-iteration loop materializes the triads on the stack.
-    let (p0, p1, p2) = (peer[0], peer[1], peer[2]);
+    const fn nxt<const F: usize>(k: usize) -> usize {
+        (F + k) % 3
+    }
+    let (p0, p1, p2) = (nxt::<FROM>(1), nxt::<FROM>(2), FROM);
     box_restrict::<VERTICAL>(
         state,
         *box_peers.get_unchecked(p0),
-        positive_triads_to_box_candidates(*peer_triads.get_unchecked(p0), VERTICAL),
+        positive_triads_to_box_candidates(peer_triad(triads, p0), VERTICAL),
     ) && box_restrict::<VERTICAL>(
         state,
         *box_peers.get_unchecked(p1),
-        positive_triads_to_box_candidates(*peer_triads.get_unchecked(p1), VERTICAL),
+        positive_triads_to_box_candidates(peer_triad(triads, p1), VERTICAL),
     ) && box_restrict::<VERTICAL>(
         state,
         *box_peers.get_unchecked(p2),
-        positive_triads_to_box_candidates(*peer_triads.get_unchecked(p2), VERTICAL),
+        positive_triads_to_box_candidates(peer_triad(triads, p2), VERTICAL),
     )
+}
+
+/// One band peer's positive triads. `p` is always a constant after inlining,
+/// so the selection folds away entirely.
+#[inline(always)]
+unsafe fn peer_triad(triads: C16, p: usize) -> C8 {
+    if p == 0 {
+        triads.get_lo()
+    } else if p == 1 {
+        triads.get_lo().rotate_cols()
+    } else {
+        triads.get_hi()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -923,6 +999,39 @@ impl Solver {
 /// Per-cell indexing: [box_i, box_j, box, elem_i, elem_j, elem].
 const BOX_INDEXING: [[u8; 6]; 81] = build_box_indexing();
 
+/// Per-cell [row, column], for accumulating the initial digit masks.
+const ROW_COL_OF: [[u8; 2]; 81] = build_row_col();
+
+const fn build_row_col() -> [[u8; 2]; 81] {
+    let mut t = [[0u8; 2]; 81];
+    let mut cell = 0;
+    while cell < 81 {
+        t[cell] = [(cell / 9) as u8, (cell % 9) as u8];
+        cell += 1;
+    }
+    t
+}
+
+/// Byte shuffles spreading three packed u16 digit masks over the 4x4 matrix:
+/// ROW_BCAST copies entry i into every lane of matrix row i, COL_BCAST copies
+/// entry j into every lane of matrix column j. The source is the quadword of
+/// three masks broadcast to all four 64-bit lanes, so both 128-bit halves can
+/// reach every entry.
+static ROW_BCAST: [u8; 32] = build_bcast(true);
+static COL_BCAST: [u8; 32] = build_bcast(false);
+
+const fn build_bcast(by_row: bool) -> [u8; 32] {
+    let mut t = [0u8; 32];
+    let mut b = 0;
+    while b < 32 {
+        let lane = b / 2;
+        let idx = if by_row { lane / 4 } else { lane % 4 };
+        t[b] = (2 * idx + b % 2) as u8;
+        b += 1;
+    }
+    t
+}
+
 const fn build_box_indexing() -> [[u8; 6]; 81] {
     let mut t = [[0u8; 6]; 81];
     let mut cell = 0;
@@ -973,6 +1082,49 @@ unsafe fn init_clue(state: &mut TState, cell: usize, digit: u8) {
     }
 }
 
+/// Remove from every box the digits already placed in its rows and columns
+/// by a clue in one of its band peers.
+///
+/// `init_clue` only ever touches the clue's own box and the two bands' pending
+/// configuration eliminations, so this deduction -- the most elementary one
+/// there is -- otherwise has to travel box -> band configurations -> positive
+/// triads -> box before it lands. Doing it directly costs nine vector updates
+/// and removes a fifth of the propagation on easy puzzles, where that first
+/// cascade is most of the work: box entries drop 22.4 -> 14.1 per puzzle and
+/// fixpoint iterations 47.4 -> 37.4.
+///
+/// Lanes already down to a single candidate are left alone. Those are the clue
+/// cells (whose own digit is in `row_digits` by definition, so eliminating it
+/// would empty the cell) plus any cell the clue eliminations happened to
+/// reduce to one. Skipping the latter costs nothing: a genuine conflict there
+/// is still found by propagation, exactly as it is today.
+#[inline]
+unsafe fn seed_peer_eliminations(
+    state: &mut TState,
+    row_digits: &[u16; 12],
+    col_digits: &[u16; 12],
+) {
+    let row_ctrl = C16(_mm256_loadu_si256(ROW_BCAST.as_ptr() as *const __m256i));
+    let col_ctrl = C16(_mm256_loadu_si256(COL_BCAST.as_ptr() as *const __m256i));
+    let cells_only = c16(&CELL3X3_MASK);
+    let one = C16::all(1);
+    for bx in 0..9 {
+        // SAFETY: bx < 9, so the band offsets are at most 6 and the quadword
+        // loads read entries 6..9 of arrays padded to 12.
+        let rp = row_digits.as_ptr().add(*DIV3.get_unchecked(bx) * 3);
+        let cp = col_digits.as_ptr().add(*MOD3.get_unchecked(bx) * 3);
+        let r = (rp as *const u64).read_unaligned();
+        let c = (cp as *const u64).read_unaligned();
+        let spread = C16(_mm256_set1_epi64x(r as i64))
+            .shuffle(row_ctrl)
+            .or(C16(_mm256_set1_epi64x(c as i64)).shuffle(col_ctrl));
+        let cells = *state.boxen.get_unchecked(bx);
+        let settled = cells.popcounts9().which_equal(one);
+        *state.boxen.get_unchecked_mut(bx) =
+            cells.and_not(spread.and(cells_only).and_not(settled));
+    }
+}
+
 unsafe fn init_and_propagate(state: &mut TState, clues: &[u8; 81]) -> bool {
     // Build a bitmask of clue positions branchlessly (three overlapping
     // 32-byte loads; the third covers cells 49..81), then bit-scan it, so
@@ -993,15 +1145,44 @@ unsafe fn init_and_propagate(state: &mut TState, clues: &[u8; 81]) -> bool {
     )) as u32;
     let mut lo = !(m_a as u64 | (m_b as u64) << 32); // clue cells 0..64
     let mut hi = (!m_c >> 15) & 0x1ffff; // clue cells 64..81
+    // Digits already placed in each row and column, for `seed_peer_eliminations`.
+    // Padded to 12 so the quadword loads below stay in bounds.
+    let mut row_digits = [0u16; 12];
+    let mut col_digits = [0u16; 12];
     while lo != 0 {
         let cell = lo.trailing_zeros() as usize;
         lo &= lo - 1;
-        init_clue(state, cell, *clues.get_unchecked(cell));
+        let digit = *clues.get_unchecked(cell);
+        init_clue(state, cell, digit);
+        let rc = ROW_COL_OF.get_unchecked(cell);
+        let bit = 1u16 << (digit - 1);
+        *row_digits.get_unchecked_mut(rc[0] as usize) |= bit;
+        *col_digits.get_unchecked_mut(rc[1] as usize) |= bit;
     }
     while hi != 0 {
         let cell = 64 + hi.trailing_zeros() as usize;
         hi &= hi - 1;
-        init_clue(state, cell, *clues.get_unchecked(cell));
+        let digit = *clues.get_unchecked(cell);
+        init_clue(state, cell, digit);
+        let rc = ROW_COL_OF.get_unchecked(cell);
+        let bit = 1u16 << (digit - 1);
+        *row_digits.get_unchecked_mut(rc[0] as usize) |= bit;
+        *col_digits.get_unchecked_mut(rc[1] as usize) |= bit;
+    }
+    seed_peer_eliminations(state, &row_digits, &col_digits);
+    // Drain each box before the bands run. The seeded eliminations can leave
+    // a box strictly inside what its bands are about to ask for, and
+    // `box_restrict`'s subset fast path would then skip it -- so what the
+    // seeding let the box deduce would never reach the band configurations,
+    // and the branching heuristic, which reads only those, would go in blind
+    // (17-clue guesses measured 0.38 -> 1.39 per puzzle without this). The
+    // drain sits before the cascade, where it costs one pass over the boxes
+    // and the cascade below then runs exactly once; in the hybrid, puzzles
+    // that never branch are the jcz engine's and rarely arrive here.
+    for bx in 0..9 {
+        if !seed_box_assertions(state, bx) {
+            return false;
+        }
     }
     // One batched eliminate per band nearly always completes initialization.
     band_eliminate::<0>(state, 0, 1)

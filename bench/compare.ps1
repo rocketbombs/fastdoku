@@ -30,5 +30,11 @@ foreach ($s in $sets) {
     if (Test-Path .\bench\out\tdoku_fastpath.exe) {
         & .\bench\out\tdoku_fastpath.exe $path --rounds $s.r --limit $Limit
     }
+    # Optional: the rust_sudoku harness (see bench/rust_sudoku_bench.rs for
+    # how to build it; AGPL, so it is a separate crate). Point $env:RSBENCH
+    # at the built rsbench.exe to include it.
+    if ($env:RSBENCH -and (Test-Path $env:RSBENCH)) {
+        & $env:RSBENCH $path --rounds $s.r --limit $Limit
+    }
     Write-Host ""
 }
