@@ -201,15 +201,21 @@ impl C16 {
         _mm256_movemask_epi8(lt) != 0
     }
     /// Per-lane popcount, assuming the 7 high bits of every lane are zero.
+    ///
+    /// The nibble table is left as a plain constant. Pinning it in a register
+    /// with inline asm was tried: it did remove the per-iteration
+    /// `vbroadcasti128`, but spending one of sixteen vector registers cost
+    /// three instructions elsewhere and measured no faster. The broadcast
+    /// issues on the load port, which this loop is not short of.
     #[inline(always)]
     unsafe fn popcounts9(self) -> C16 {
-        let lookup = _mm256_setr_epi8(
+        let lut = _mm256_setr_epi8(
             0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3,
             2, 3, 3, 4,
         );
         let mask4 = _mm256_set1_epi16(0x0f);
-        let sum_0_3 = _mm256_shuffle_epi8(lookup, _mm256_and_si256(self.0, mask4));
-        let sum_4_7 = _mm256_shuffle_epi8(lookup, _mm256_srli_epi16::<4>(self.0));
+        let sum_0_3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(self.0, mask4));
+        let sum_4_7 = _mm256_shuffle_epi8(lut, _mm256_srli_epi16::<4>(self.0));
         let sum_0_7 = _mm256_add_epi16(sum_0_3, sum_4_7);
         C16(_mm256_add_epi16(sum_0_7, _mm256_srli_epi16::<8>(self.0)))
     }
@@ -227,6 +233,11 @@ impl C16 {
     unsafe fn rotate_rows2(self) -> C16 {
         C16(_mm256_shuffle_epi32::<0b10110001>(self.0))
     }
+    /// Rotate the elements of each matrix row left by three.
+    #[inline(always)]
+    unsafe fn rotate_rows3(self) -> C16 {
+        unsafe { C16(_mm256_shuffle_epi8(self.0, c16(&ROW_ROT3).0)) }
+    }
     /// Rotate the matrix rows up by one (element (r,c) <- (r+1,c)).
     #[inline(always)]
     unsafe fn rotate_cols(self) -> C16 {
@@ -236,6 +247,11 @@ impl C16 {
     #[inline(always)]
     unsafe fn rotate_cols2(self) -> C16 {
         C16(_mm256_permute4x64_epi64::<0b01001110>(self.0))
+    }
+    /// Rotate the matrix rows up by three.
+    #[inline(always)]
+    unsafe fn rotate_cols3(self) -> C16 {
+        C16(_mm256_permute4x64_epi64::<0b10010011>(self.0))
     }
     #[inline(always)]
     unsafe fn extract_rows_u64(self) -> [u64; 4] {
@@ -354,6 +370,11 @@ static CELL3X3_MASK: [u16; 16] = [
 ];
 
 // Row rotations restricted to the 3x3 submatrix (margins kept in place).
+// Rotate each 4-wide matrix row right by one (i.e. left by three).
+static ROW_ROT3: [u16; 16] = [
+    S3, S0, S1, S2, S7, S4, S5, S6, S3, S0, S1, S2, S7, S4, S5, S6,
+];
+
 static ROW_ROTATE_3X3_1: [u16; 16] = [
     S1, S2, S0, S3, S5, S6, S4, S7, S1, S2, S0, S3, S4, S5, S6, S7,
 ];
@@ -362,7 +383,20 @@ static ROW_ROTATE_3X3_2: [u16; 16] = [
 ];
 
 // Extracts horizontal triad literals (matrix lanes 3, 7, 11) into lanes 4..6.
-static H_TRIADS_CTRL: [u16; 16] = [XX, XX, XX, XX, S3, S7, XX, XX, XX, XX, XX, XX, XX, XX, S3, XX];
+// Controls for the fused triad-message build (see `triad_message`). A takes
+// the horizontal triads that live in the low 128-bit lane (matrix lanes 3
+// and 7) to positions 4 and 5, and passes the high lane through unchanged
+// because the vertical triads already sit at positions 4..6 there. B picks
+// the third horizontal triad (matrix lane 11) out of the *other* 128-bit
+// lane, which is why its input is the half-swapped vector.
+static TRIAD_MSG_A: [u16; 16] = [
+    XX, XX, XX, XX, S3, S7, XX, XX, // low: lanes 3,7 -> 4,5
+    S0, S1, S2, S3, S4, S5, S6, S7, // high: identity passthrough
+];
+static TRIAD_MSG_B: [u16; 16] = [
+    XX, XX, XX, XX, XX, XX, S3, XX, // low: swapped lane 3 (= lane 11) -> 6
+    XX, XX, XX, XX, XX, XX, XX, XX, // high: contribute nothing
+];
 
 // Minimum candidates per lane: cells >= 1; negative triads >= 6, because
 // exactly 3 of 9 digits live in a triad. Popcount equality with the minimum
@@ -475,36 +509,53 @@ unsafe fn positive_triads_to_box_candidates(triads: C8, orientation: usize) -> C
         .or(tmp.shuffle(c16(&POS_TRIADS_TO_CANDIDATES[orientation][1])))
 }
 
-/// Extract horizontal triad literals into lanes 4..6 of a C8.
+/// Build the band elimination message from a box vector: horizontal triad
+/// literals in positions 4..6 of the low half, vertical triads in positions
+/// 4..6 of the high half.
+///
+/// Done as one fused permutation rather than extracting the two triad sets
+/// and reassembling them. The high half needs no work at all -- the vertical
+/// triads already occupy positions 4..6 there -- and of the three horizontal
+/// triads, only the third lives in the other 128-bit lane, so a single
+/// half-swap plus two in-lane shuffles reaches everything.
+///
+/// Replaces shuffle + 2x vextracti128 + or + vinserti128 (4 shuffle-port
+/// ops) with vpermq + 2x vpshufb + or (3 shuffle-port ops), per call site.
 #[inline(always)]
-unsafe fn horizontal_triads(cells: C16) -> C8 {
-    let split = cells.shuffle(c16(&H_TRIADS_CTRL));
-    split.get_lo().or(split.get_hi())
-}
-
-/// Vertical triad literals already sit in lanes 4..6 of the high half.
-#[inline(always)]
-unsafe fn vertical_triads(cells: C16) -> C8 {
-    cells.get_hi()
+unsafe fn triad_message(x: C16) -> C16 {
+    let swapped = x.rotate_cols2(); // swap the two 128-bit halves
+    C16(_mm256_or_si256(
+        _mm256_shuffle_epi8(x.0, c16(&TRIAD_MSG_A).0),
+        _mm256_shuffle_epi8(swapped.0, c16(&TRIAD_MSG_B).0),
+    ))
 }
 
 /// Hidden singles over the exactly-one clauses along matrix rows or columns
 /// (depending on the rotate), OR'd into `assertions`.
+/// `r1`, `r2`, `r3` are the three rotations of `cells` along the axis being
+/// scanned, passed in rather than chained: a candidate present in exactly one
+/// of the four is a hidden single.
+///
+/// `two_or_more` accumulates serially rather than as a balanced tree. The
+/// tree is one level shallower for the same seven operations and looks like
+/// the better choice, but it keeps all three rotations plus four partials
+/// live at once; measured, it pushed the loop from 77 to 81 instructions
+/// through rematerialization and ran ~0.7% slower. The accumulation retires
+/// each rotation as it goes.
 #[inline(always)]
-unsafe fn gather_triad_clause_assertions<F: Fn(C16) -> C16>(
+unsafe fn gather_clause_assertions(
     cells: C16,
-    rotate: F,
+    r1: C16,
+    r2: C16,
+    r3: C16,
     assertions: C16,
 ) -> C16 {
     let mut one_or_more = cells;
-    let mut rotated = rotate(cells);
-    let mut two_or_more = one_or_more.and(rotated);
-    one_or_more = one_or_more.or(rotated);
-    rotated = rotate(rotated);
-    two_or_more = one_or_more.and(rotated).or(two_or_more);
-    one_or_more = one_or_more.or(rotated);
-    rotated = rotate(rotated);
-    two_or_more = one_or_more.and(rotated).or(two_or_more);
+    let mut two_or_more = cells.and(r1);
+    one_or_more = one_or_more.or(r1);
+    two_or_more = one_or_more.and(r2).or(two_or_more);
+    one_or_more = one_or_more.or(r2);
+    two_or_more = one_or_more.and(r3).or(two_or_more);
     cells.and_not(two_or_more).or(assertions)
 }
 
@@ -521,12 +572,23 @@ unsafe fn assertions_to_eliminations(
 ) {
     let cell_assertions_only = assertions.and(c16(&CELL3X3_MASK));
     // Broadcast assertions across their rows and columns.
-    let mut across_rows = cell_assertions_only;
-    across_rows = across_rows.or(across_rows.rotate_rows());
-    across_rows = across_rows.or(across_rows.rotate_rows2());
-    let mut across_cols = cell_assertions_only;
-    across_cols = across_cols.or(across_cols.rotate_cols());
-    across_cols = across_cols.or(across_cols.rotate_cols2());
+    // Same tree treatment as across_cols below, though the payoff is smaller
+    // here: in-lane row rotations are 1-cycle, so this trades one op for one
+    // cycle rather than three.
+    let ar1 = cell_assertions_only.rotate_rows();
+    let ar2 = cell_assertions_only.rotate_rows2();
+    let ar3 = cell_assertions_only.rotate_rows3();
+    let across_rows = cell_assertions_only.or(ar1).or(ar2.or(ar3));
+    // Rotate three ways off the same source and OR as a balanced tree. The
+    // obvious `x |= rot(x)` log-reduction is one shuffle cheaper, but it
+    // chains permute -> or -> permute -> or, and a cross-lane permute costs 3
+    // cycles: 8 cycles of latency against 5 for three independent permutes
+    // plus a two-level OR. This sits on the loop-carried critical path, where
+    // latency is worth more than the extra op.
+    let ac1 = cell_assertions_only.rotate_cols();
+    let ac2 = cell_assertions_only.rotate_cols2();
+    let ac3 = cell_assertions_only.rotate_cols3();
+    let across_cols = cell_assertions_only.or(ac1).or(ac2.or(ac3));
     // The 3x3 submatrix eliminates an asserted digit everywhere in the box;
     // margins pick up row/col broadcasts; asserted cells eliminate all bits.
     let new_box_elims = across_cols
@@ -540,11 +602,8 @@ unsafe fn assertions_to_eliminations(
     // Negative triad assertions kill the configurations placing the digit
     // there (shift 0); asserted cells imply positive triads, killing the
     // configurations placing the digit at the other elements (shifts 1, 2).
-    let hv_neg = C16::from_parts(horizontal_triads(assertions), vertical_triads(assertions));
-    let hv_pos = C16::from_parts(
-        horizontal_triads(new_box_elims),
-        vertical_triads(new_box_elims),
-    );
+    let hv_neg = triad_message(assertions);
+    let hv_pos = triad_message(new_box_elims);
     let idx = box_j * 3 + box_i;
     let new_elims = hv_neg
         .shuffle(c16(&TRIADS_SHIFT0_TO_CONFIG_ELIMS16[idx]))
@@ -584,9 +643,12 @@ unsafe fn box_restrict_full<const FROM_VERTICAL: usize>(
     let box_j = *MOD3.get_unchecked(box_idx);
     let box_minimums = c16(&BOX_MINIMUMS);
 
+    // Carry the box in a register across iterations and write it back once on
+    // exit. Nothing inside the loop reads it, and on the contradiction exit
+    // the caller discards this state, so the intermediate stores were dead.
+    let mut cells = *state.boxen.get_unchecked(box_idx);
     loop {
-        let cells = state.boxen.get_unchecked(box_idx).and_not(eliminating);
-        *state.boxen.get_unchecked_mut(box_idx) = cells;
+        cells = cells.and_not(eliminating);
         let counts = cells.popcounts9();
         if counts.any_less_than(box_minimums) {
             return false;
@@ -595,8 +657,20 @@ unsafe fn box_restrict_full<const FROM_VERTICAL: usize>(
         // plus hidden singles along the exactly-one row/column clauses.
         let triggered = counts.which_equal(box_minimums);
         let mut assertions = cells.and(triggered);
-        assertions = gather_triad_clause_assertions(cells, |v| v.rotate_rows(), assertions);
-        assertions = gather_triad_clause_assertions(cells, |v| v.rotate_cols(), assertions);
+        assertions = gather_clause_assertions(
+            cells,
+            cells.rotate_rows(),
+            cells.rotate_rows2(),
+            cells.rotate_rows3(),
+            assertions,
+        );
+        assertions = gather_clause_assertions(
+            cells,
+            cells.rotate_cols(),
+            cells.rotate_cols2(),
+            cells.rotate_cols3(),
+            assertions,
+        );
 
         // The band elimination accumulators are one register each; copy out,
         // update, copy back.
@@ -613,13 +687,13 @@ unsafe fn box_restrict_full<const FROM_VERTICAL: usize>(
         state.bands.get_unchecked_mut(box_i).get_unchecked_mut(0).eliminations = h_elims;
         state.bands.get_unchecked_mut(box_j).get_unchecked_mut(1).eliminations = v_elims;
 
-        // `cells` was just stored to boxen[box_idx] and nothing since has
-        // touched it, so test the value we already hold rather than making
-        // the compiler reload it.
+        // Test the value already in hand rather than re-reading the box.
         if !eliminating.intersects(cells) {
             break;
         }
     }
+    *state.boxen.get_unchecked_mut(box_idx) = cells;
+
     // Forward to band peers, visiting the opposite orientation first.
     if FROM_VERTICAL != 0 {
         band_eliminate::<0>(state, box_i, box_j) && band_eliminate::<1>(state, box_j, box_i)

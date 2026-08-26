@@ -25,14 +25,13 @@ puzzle to the first solution.
 
 | Dataset | puzzles | **fastdoku** | tdoku | tdoku+fastpath\* | vs tdoku | vs +fastpath |
 |---------|--------:|-------------:|------:|-----------------:|---------:|-------------:|
-| puzzles0_kaggle             |   100,000 | **911 ns** | 1104 ns | 989 ns | 1.21x | 1.09x |
-| puzzles1_unbiased           | 1,000,000 | **2.351 us** | 2.820 | 2.538 | 1.20x | 1.08x |
-| puzzles2_17_clue            |    49,158 | **2.466 us** | 3.061 | 2.732 | 1.24x | 1.11x |
-| puzzles7_serg_benchmark     |    10,000 | **1.531 us** | 1.826 | 1.624 | 1.19x | 1.06x |
-| puzzles3_magictour_top1465  |     1,465 | **4.960 us** | 5.765 | 5.251 | 1.16x | 1.06x |
-| puzzles4_forum_hardest_1905 | 2,135,371 | **18.46 us** | — | 19.54 | — | 1.06x |
-| puzzles5_forum_hardest_11+  |    48,766 | **22.20 us** | 25.45 | 23.41 | 1.15x | 1.05x |
-| puzzles6_forum_hardest_1106 |       375 | **35.59 us** | 41.06 | 37.65 | 1.15x | 1.06x |
+| puzzles0_kaggle             |   100,000 | **892 ns** | 1109 ns | 1000 ns | 1.24x | 1.12x |
+| puzzles1_unbiased           | 1,000,000 | **2.268 us** | 2.814 | 2.533 | 1.24x | 1.12x |
+| puzzles2_17_clue            |    49,158 | **2.374 us** | 3.056 | 2.731 | 1.29x | 1.15x |
+| puzzles7_serg_benchmark     |    10,000 | **1.478 us** | 1.830 | 1.627 | 1.24x | 1.10x |
+| puzzles3_magictour_top1465  |     1,465 | **4.781 us** | 5.771 | 5.252 | 1.21x | 1.10x |
+| puzzles5_forum_hardest_11+  |    48,766 | **21.25 us** | 25.46 | 23.43 | 1.20x | 1.10x |
+| puzzles6_forum_hardest_1106 |       375 | **34.18 us** | 40.87 | 37.61 | 1.20x | 1.10x |
 
 \* **tdoku+fastpath is tdoku with fastdoku's one structural optimization
 backported** (see below). It is not upstream tdoku; it exists to isolate how
@@ -143,10 +142,48 @@ Three other measured wins:
   puzzles).
 - **PGO** (1.5-4%).
 
-One measured *loss* worth recording: rewriting the contradiction check from
-`movemask`+`cmp` to the shorter `vptest` form removed an instruction but ran
-~1% slower. This loop is vector-port bound, so moving the test onto the
-integer ports is worth more than the instruction it costs.
+### Scheduling the propagation loop
+
+Disassembling the fixpoint loop and working through it instruction by
+instruction produced one more win, and it is the opposite of what counting
+instructions suggests. The loop is **latency bound on its loop-carried
+dependency chain**, not throughput bound, so the payoff is in shortening that
+chain even at the cost of extra work:
+
+- **Broadcasting an assertion across its column** was a running `x |= rot(x)`
+  reduction: two cross-lane permutes, but chained as permute, or, permute, or
+  — 8 cycles, because a cross-lane permute costs 3. Issuing three independent
+  permutes off the same source and OR-ing them as a tree is one *more*
+  instruction and 5 cycles. **Worth 2-4%**, and most on the hardest puzzles,
+  where the loop iterates more.
+- The same treatment on the row direction, where in-lane rotations cost 1
+  cycle instead of 3, is worth almost nothing — kept, but it is noise.
+- **Building the band elimination message** used shuffle + two
+  `vextracti128` + or + `vinserti128` per value. The high half already holds
+  the vertical triads in the right places, and only one of the three
+  horizontal triads lives in the other 128-bit lane, so a half-swap plus two
+  in-lane shuffles reaches everything: 4 shuffle-port ops instead of 6.
+  Worth ~0.5%.
+
+Three measured *losses*, all recorded because they look like obvious wins:
+
+- Rewriting the contradiction check from `movemask`+`cmp` to the shorter
+  `vptest` form removed an instruction and ran **~1% slower**. The loop is
+  vector-port bound for throughput; moving the test to the integer ports is
+  worth more than the instruction it costs.
+- Building `two_or_more` as a balanced tree rather than a running
+  accumulation is one level shallower for identical op count, but keeps three
+  rotations and four partials live at once. It pushed the loop from 77 to 81
+  instructions through rematerialization and ran **~0.7% slower**.
+- Pinning the popcount nibble table in a register with inline `asm!` (to stop
+  it being re-broadcast every iteration) worked — the `vbroadcasti128` left
+  the loop — but spending one of sixteen vector registers cost three
+  instructions elsewhere, for **no measurable change**. The broadcast issues
+  on the load port, which this loop has to spare. LLVM's choice was correct.
+
+The pattern: instructions that sit on an idle port are free, and the compiler
+already knows it. The loop ends up at 80 instructions — two *more* than
+before this pass — and 3.5% faster.
 
 ### Other engines
 
