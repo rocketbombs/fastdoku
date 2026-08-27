@@ -198,72 +198,111 @@ const fn build_same_band_ok() -> [u32; 27] {
     t
 }
 
-/// ROWS3[m]: 3-bit rows-of-band mask -> those full rows as band cells.
-static ROWS3: [u32; 8] = build_rows3();
+/// CELL_UNITS[cell]: the three unit bits a clue in this cell contributes to
+/// its digit's `unit_mask` -- its row and its box, as six bits per band
+/// (rows low, boxes high), and its column in bits 18..27. One table and one
+/// or per clue in place of three of each.
+static CELL_UNITS: [u32; 81] = build_cell_units();
 
-const fn build_rows3() -> [u32; 8] {
-    let mut t = [0u32; 8];
-    let mut m = 0;
-    while m < 8 {
-        let mut r = 0;
-        while r < 3 {
-            if m & (1 << r) != 0 {
-                t[m] |= 0x1ff << (9 * r);
-            }
-            r += 1;
-        }
-        m += 1;
-    }
-    t
-}
-
-/// BOX3[m]: 3-bit boxes-of-band mask -> those full boxes as band cells.
-static BOX3: [u32; 8] = build_box3();
-
-const fn build_box3() -> [u32; 8] {
-    let mut t = [0u32; 8];
-    let mut m = 0;
-    while m < 8 {
-        let mut k = 0;
-        while k < 3 {
-            if m & (1 << k) != 0 {
-                t[m] |= (0b111 << (3 * k)) * 0o001_001_001;
-            }
-            k += 1;
-        }
-        m += 1;
-    }
-    t
-}
-
-/// CELL_IX[cell]: [row, col, band, box, pos-in-band].
-static CELL_IX: [[u8; 5]; 81] = build_cell_ix();
-
-const fn build_cell_ix() -> [[u8; 5]; 81] {
-    let mut t = [[0u8; 5]; 81];
+const fn build_cell_units() -> [u32; 81] {
+    let mut t = [0u32; 81];
     let mut c = 0;
     while c < 81 {
         let (row, col) = (c / 9, c % 9);
-        t[c] = [row as u8, col as u8, (row / 3) as u8, (row / 3 * 3 + col / 3) as u8, (c % 27) as u8];
+        let band = row / 3;
+        t[c] = (1 << (6 * band + row % 3)) | (1 << (6 * band + 3 + col / 3)) | (1 << (18 + col));
         c += 1;
     }
     t
 }
 
-/// SHRINK[r]: 9-bit row -> 3-bit minirow occupancy. A table rather than the
-/// bit-fold: three parallel loads beat a seven-cycle ALU chain on the
-/// critical path of every subband update.
-static SHRINK: [u8; 512] = build_shrink();
+/// CELL_POS[cell]: the cell's bit within its band.
+static CELL_POS: [u32; 81] = build_cell_pos();
 
-const fn build_shrink() -> [u8; 512] {
-    let mut t = [0u8; 512];
-    let mut r = 0usize;
-    while r < 512 {
-        let f = r | (r >> 1) | (r >> 2);
-        t[r] = ((f & 1) | ((f >> 2) & 2) | ((f >> 4) & 4)) as u8;
-        r += 1;
+const fn build_cell_pos() -> [u32; 81] {
+    let mut t = [0u32; 81];
+    let mut c = 0;
+    while c < 81 {
+        t[c] = 1 << (c % 27);
+        c += 1;
     }
     t
+}
+
+/// CELL_SLOT[cell]: the cell's band, so a clue's `clue_bits` slot is
+/// `digit * 3 + CELL_SLOT[cell]`.
+static CELL_SLOT: [u8; 81] = build_cell_slot();
+
+const fn build_cell_slot() -> [u8; 81] {
+    let mut t = [0u8; 81];
+    let mut c = 0;
+    while c < 81 {
+        t[c] = (c / 27) as u8;
+        c += 1;
+    }
+    t
+}
+
+/// ROWBOX[sel]: for one band, the cells covered by the full rows and full
+/// boxes named by a six-bit selector (rows in bits 0..3, boxes in 3..6).
+/// Carrying rows and boxes in one 256-byte table makes each subband's
+/// eliminations a single lookup, and the layout pairs with `CELL_UNITS` so
+/// the selector is one shift and one mask.
+static ROWBOX: [u32; 64] = build_rowbox();
+
+const fn build_rowbox() -> [u32; 64] {
+    let mut t = [0u32; 64];
+    let mut i = 0usize;
+    while i < 64 {
+        let mut m = 0u32;
+        let mut r = 0;
+        while r < 3 {
+            if i & (1 << r) != 0 {
+                m |= 0x1ff << (9 * r);
+            }
+            r += 1;
+        }
+        let mut b = 0;
+        while b < 3 {
+            if i & (1 << (3 + b)) != 0 {
+                m |= (0b111 << (3 * b)) * 0o001_001_001;
+            }
+            b += 1;
+        }
+        t[i] = m;
+        i += 1;
+    }
+    t
+}
+
+/// Condense a band's 27 cell bits to its 9-bit minirow occupancy.
+///
+/// `m | m>>1 | m>>2` puts each minirow's or at the minirow's first cell, so
+/// the nine bits wanted are those at positions 0, 3, 6, ... -- exactly a bit
+/// extract. On Zen 3 `pext` is 3-cycle hardware, which beats the three
+/// dependent table loads this replaces: it takes a load off the critical
+/// path of every subband update (the result feeds straight into the
+/// `CLOSED_CELLS` lookup) and frees 512 bytes of L1 besides.
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+fn shrink_band(m: u32) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::_pext_u32;
+    // SAFETY: `_pext_u32` is a pure BMI2 arithmetic intrinsic, gated above.
+    unsafe { _pext_u32(m | (m >> 1) | (m >> 2), 0o111_111_111) }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+#[inline(always)]
+fn shrink_band(m: u32) -> u32 {
+    let f = m | (m >> 1) | (m >> 2);
+    let mut s = 0;
+    let mut i = 0;
+    while i < 9 {
+        s |= ((f >> (3 * i)) & 1) << i;
+        i += 1;
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -292,52 +331,54 @@ struct Unsat;
 
 
 
-/// Same digit, other two bands.
-#[inline(always)]
-fn neighbors(sb: usize) -> (usize, usize) {
-    let a = sb + 9;
-    let b = sb + 18;
-    (if a >= 27 { a - 27 } else { a }, if b >= 27 { b - 27 } else { b })
+
+
+/// NEIGH[sb]: the same digit's other two bands, `(sb + 9) % 27` and
+/// `(sb + 18) % 27`. A table because the modulo compiles to three `lea`s,
+/// two compares and two `cmov`s on the critical path of every update, and
+/// the loads issue on ports the update loop has to spare.
+static NEIGH: [[u8; 2]; 27] = build_neigh();
+
+const fn build_neigh() -> [[u8; 2]; 27] {
+    let mut t = [[0u8; 2]; 27];
+    let mut sb = 0;
+    while sb < 27 {
+        t[sb] = [((sb + 9) % 27) as u8, ((sb + 18) % 27) as u8];
+        sb += 1;
+    }
+    t
 }
 
 impl State {
-    fn new() -> State {
-        State { poss: [ALL; 27], dirty: (1 << 27) - 1, unsolved: [ALL; 3], pairs: [0; 3] }
-    }
-
     /// Build the state from the clue grid in one batched pass.
     ///
-    /// A per-clue insert walks 81 cells behind a data-dependent branch (a
-    /// mispredict per clue boundary) and does a dozen read-modify-writes per
-    /// clue. Instead: scan the clue positions from a bitmask, accumulate
-    /// per-digit row/column/box masks plus per-(band, digit) restore masks,
-    /// and then construct each of the 27 subbands with a few table lookups.
-    /// Duplicate clues in a unit are detected during accumulation.
+    /// Per clue this is now two table loads and two read-modify-writes: the
+    /// digit's row, box and column bits go into one `unit_mask` word, and the
+    /// cell's own bit into one `clue_bits` word. The three separate unit
+    /// arrays, the three duplicate tests and the separate `clue_cells`
+    /// accumulation it replaces were together about two thirds of the scan.
+    ///
+    /// Duplicates fall out of a count instead of a test: every clue
+    /// contributes exactly three unit bits, so if two clues share a row, box
+    /// or column the or loses one and the total falls short.
     fn init_from_clues(clues: &[u8; 81]) -> Result<State, Unsat> {
-        // rows/cols/boxes containing each digit; slot 0 is never written.
-        let mut rows10 = [0u16; 10];
-        let mut cols10 = [0u16; 10];
-        let mut boxes10 = [0u16; 10];
-        // Restore masks: clue cells per (band, digit); slot 0 unused.
-        let mut clue_bits = [[0u32; 10]; 3];
-        let mut clue_cells = [0u32; 3];
-        let mut dup = 0u16;
+        // unit_mask[digit]: rows|boxes per band in bits 0..18, columns in 18..27.
+        let mut unit_mask = [0u32; 10];
+        // clue_bits[digit * 3 + band]: the clue cells of that digit in that band.
+        let mut clue_bits = [0u32; 30];
 
         let mut visit = |cell: usize| {
-            let d = clues[cell] as usize; // 1..=9
-            let ix = CELL_IX[cell];
-            let (row, col, band, bx, pos) =
-                (ix[0] as usize, ix[1] as usize, ix[2] as usize, ix[3] as usize, ix[4] as usize);
-            dup |= (rows10[d] >> row) & 1;
-            dup |= (cols10[d] >> col) & 1;
-            dup |= (boxes10[d] >> bx) & 1;
-            rows10[d] |= 1 << row;
-            cols10[d] |= 1 << col;
-            boxes10[d] |= 1 << bx;
-            clue_bits[band][d] |= 1 << pos;
-            clue_cells[band] |= 1 << pos;
+            // SAFETY: cell < 81, and clue digits are 1..=9 by construction of
+            // the scan below, so both indices are in range.
+            unsafe {
+                let d = *clues.get_unchecked(cell) as usize;
+                *unit_mask.get_unchecked_mut(d) |= *CELL_UNITS.get_unchecked(cell);
+                let slot = d * 3 + *CELL_SLOT.get_unchecked(cell) as usize;
+                *clue_bits.get_unchecked_mut(slot) |= *CELL_POS.get_unchecked(cell);
+            }
         };
 
+        let n_clues;
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             // Clue positions as a bitmask via three overlapping 32-byte
@@ -366,6 +407,7 @@ impl State {
             };
             let mut lo = !(m_a as u64 | (m_b as u64) << 32);
             let mut hi = (!m_c >> 15) & 0x1ffff;
+            n_clues = lo.count_ones() + hi.count_ones();
             while lo != 0 {
                 visit(lo.trailing_zeros() as usize);
                 lo &= lo - 1;
@@ -376,36 +418,71 @@ impl State {
             }
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-        for cell in 0..81 {
-            if clues[cell] != 0 {
-                visit(cell);
+        {
+            let mut n = 0;
+            for cell in 0..81 {
+                if clues[cell] != 0 {
+                    visit(cell);
+                    n += 1;
+                }
             }
+            n_clues = n;
         }
 
-        if dup != 0 {
+        let mut unit_bits = 0u32;
+        for d in 1..=9usize {
+            unit_bits += unit_mask[d].count_ones();
+        }
+        if unit_bits != 3 * n_clues {
             return Err(Unsat);
         }
 
-        let mut st = State::new();
+        // Solved cells per band, folded out of the per-digit clue masks.
+        let mut clue_cells = [0u32; 3];
         for d in 1..=9usize {
-            let cs = cols10[d] as u32;
-            let colspread = cs | (cs << 9) | (cs << 18);
-            for band in 0..3 {
-                let elim = ROWS3[((rows10[d] >> (3 * band)) & 7) as usize]
-                    | colspread
-                    | BOX3[((boxes10[d] >> (3 * band)) & 7) as usize];
-                st.poss[band * 9 + d - 1] =
-                    ((ALL & !elim) & !clue_cells[band]) | clue_bits[band][d];
+            for b in 0..3 {
+                clue_cells[b] |= clue_bits[d * 3 + b];
             }
         }
-        for band in 0..3 {
-            st.unsolved[band] = ALL & !clue_cells[band];
+
+        // Every subband is written here, so the array starts uninitialised
+        // rather than being filled with ALL and immediately overwritten.
+        let mut poss = [0u32; 27];
+        for d in 1..=9usize {
+            // SAFETY: d <= 9 and b < 3 keep every index inside its table.
+            unsafe {
+                let um = *unit_mask.get_unchecked(d);
+                let cs = um >> 18;
+                let colspread = cs | (cs << 9) | (cs << 18);
+                for b in 0..3usize {
+                    let sel = ((um >> (6 * b)) & 63) as usize;
+                    let elim = *ROWBOX.get_unchecked(sel) | colspread;
+                    *poss.get_unchecked_mut(b * 9 + d - 1) =
+                        (ALL & !elim & !clue_cells[b]) | *clue_bits.get_unchecked(d * 3 + b);
+                }
+            }
         }
-        Ok(st)
+
+        Ok(State {
+            poss,
+            dirty: (1 << 27) - 1,
+            unsolved: [
+                ALL & !clue_cells[0],
+                ALL & !clue_cells[1],
+                ALL & !clue_cells[2],
+            ],
+            pairs: [0; 3],
+        })
     }
 
     /// Locked candidates, pointing eliminations, and solved-cell cleanup for
-    /// one subband. Returns Err on an unsatisfiable band.
+    /// one subband. Returns the subbands this update changed, for the
+    /// caller's worklist, or Err on an unsatisfiable band.
+    ///
+    /// The dirty bits are returned rather than OR'd into `self.dirty`
+    /// because that field is otherwise a load-modify-store per write, three
+    /// times per update, on the critical path; the caller keeps the
+    /// worklist in a register instead.
     ///
     /// SAFETY: callers pass `sb < 27` (worklist bits are only ever set for
     /// indices 0..27). Table indices are 9-bit by construction: `s` and
@@ -413,11 +490,9 @@ impl State {
     /// 0..9. The unchecked accesses eliminate bounds checks and their panic
     /// branches from the innermost loop.
     #[inline(always)]
-    unsafe fn update_subband(&mut self, sb: usize) -> Result<(), Unsat> {
+    unsafe fn update_subband(&mut self, sb: usize) -> Result<u32, Unsat> {
         let m = *self.poss.get_unchecked(sb);
-        let s = (*SHRINK.get_unchecked((m & 0x1ff) as usize) as usize)
-            | (*SHRINK.get_unchecked(((m >> 9) & 0x1ff) as usize) as usize) << 3
-            | (*SHRINK.get_unchecked((m >> 18) as usize) as usize) << 6;
+        let s = shrink_band(m) as usize;
         let allowed = *CLOSED_CELLS.get_unchecked(s);
         if allowed == 0 {
             return Err(Unsat);
@@ -428,15 +503,15 @@ impl State {
         // neighbor bands and the solved-cell detection below.
         let cols = ((m | (m >> 9) | (m >> 18)) & 0x1ff) as usize;
         let ok = *NEIGH_OK.get_unchecked(cols);
-        let (n1, n2) = neighbors(sb);
+        let nb = NEIGH.get_unchecked(sb);
+        let (n1, n2) = (nb[0] as usize, nb[1] as usize);
         let o1 = *self.poss.get_unchecked(n1);
         let o2 = *self.poss.get_unchecked(n2);
         let w1 = o1 & ok;
         let w2 = o2 & ok;
         *self.poss.get_unchecked_mut(n1) = w1;
         *self.poss.get_unchecked_mut(n2) = w2;
-        self.dirty |= ((w1 != o1) as u32) << n1;
-        self.dirty |= ((w2 != o2) as u32) << n2;
+        let mut dirty = (((w1 != o1) as u32) << n1) | (((w2 != o2) as u32) << n2);
 
         // A minirow forced to hold the digit, in a box confined to a single
         // column, is a solved cell: clear the cell from the band's other
@@ -451,24 +526,56 @@ impl State {
         let solved_mr = *FORCED.get_unchecked(s) & *COL_SINGLE.get_unchecked(cols);
         if solved_mr == 0 {
             *self.poss.get_unchecked_mut(sb) = m;
-            return Ok(());
+            return Ok(dirty);
         }
         let solved = *EXPAND.get_unchecked(solved_mr as usize) & m;
         let keep = !solved;
         let band = sb / 9;
         *self.unsolved.get_unchecked_mut(band) &= keep;
         let base = band * 9;
-        let mut db = 0u32;
+        dirty |= self.sweep_band(base, keep) & !(1 << sb);
+        *self.poss.get_unchecked_mut(sb) = m;
+        Ok(dirty)
+    }
+
+    /// Clear `!keep` from all nine of a band's subbands, returning which of
+    /// them changed. The nine are contiguous, so with AVX2 eight fall out of
+    /// one masked store plus a `movemask` — against roughly seven scalar
+    /// instructions each, and this runs on every solved cell.
+    ///
+    /// SAFETY: `base` is 0, 9 or 18, so the 8-lane access covers indices
+    /// `base..base+8` of a 27-element array and the scalar tail is
+    /// `base + 8 <= 26`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline(always)]
+    unsafe fn sweep_band(&mut self, base: usize, keep: u32) -> u32 {
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::*;
+        let p = self.poss.as_mut_ptr().add(base);
+        let old = _mm256_loadu_si256(p as *const __m256i);
+        let new = _mm256_and_si256(old, _mm256_set1_epi32(keep as i32));
+        _mm256_storeu_si256(p as *mut __m256i, new);
+        let same = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(old, new)));
+        let mut dirty = ((!same as u32) & 0xff) << base;
+        let ov = *p.add(8);
+        let nv = ov & keep;
+        *p.add(8) = nv;
+        dirty |= ((nv != ov) as u32) << (base + 8);
+        dirty
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[inline(always)]
+    unsafe fn sweep_band(&mut self, base: usize, keep: u32) -> u32 {
+        let mut dirty = 0;
         for d in 0..9 {
             let o = base + d;
             let ov = *self.poss.get_unchecked(o);
             let nv = ov & keep;
             *self.poss.get_unchecked_mut(o) = nv;
-            db |= ((nv != ov) as u32) << o;
+            dirty |= ((nv != ov) as u32) << o;
         }
-        *self.poss.get_unchecked_mut(sb) = m;
-        self.dirty |= db & !(1 << sb);
-        Ok(())
+        dirty
     }
 
     /// Drain the dirty worklist in batches: capture the current mask, process
@@ -479,20 +586,22 @@ impl State {
     /// single update the next round.
     #[inline]
     fn update_all(&mut self) -> Result<(), Unsat> {
+        let mut pending = self.dirty;
         loop {
-            let mut batch = self.dirty;
+            let mut batch = pending;
             if batch == 0 {
+                self.dirty = 0;
                 return Ok(());
             }
-            self.dirty = 0;
+            pending = 0;
             while batch != 0 {
                 let sb = batch.trailing_zeros() as usize;
                 batch &= batch - 1;
                 // An earlier update this round may have re-dirtied `sb`;
                 // this visit sees the fresh state, so drop the pending bit.
-                self.dirty &= !(1 << sb);
+                pending &= !(1 << sb);
                 // SAFETY: dirty bits are only set for subbands 0..27.
-                unsafe { self.update_subband(sb)? };
+                pending |= unsafe { self.update_subband(sb)? };
             }
         }
     }

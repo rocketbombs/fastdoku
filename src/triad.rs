@@ -216,6 +216,17 @@ impl C16 {
         C16(_mm256_add_epi16(sum_0_7, _mm256_srli_epi16::<8>(self.0)))
     }
     /// Rotate the elements of each matrix row left by one.
+    /// Shift each matrix row's elements up by one position, zero-filling.
+    /// A matrix row is one 64-bit lane, so this is a lane-wise shift.
+    #[inline(always)]
+    unsafe fn shift_rows_up1(self) -> C16 {
+        C16(_mm256_slli_epi64::<16>(self.0))
+    }
+    /// Shift each matrix row's elements up by two positions, zero-filling.
+    #[inline(always)]
+    unsafe fn shift_rows_up2(self) -> C16 {
+        C16(_mm256_slli_epi64::<32>(self.0))
+    }
     #[inline(always)]
     unsafe fn rotate_rows(self) -> C16 {
         let ctrl = _mm256_setr_epi8(
@@ -235,6 +246,16 @@ impl C16 {
         unsafe { C16(_mm256_shuffle_epi8(self.0, c16(&ROW_ROT3).0)) }
     }
     /// Rotate the matrix rows up by one (element (r,c) <- (r+1,c)).
+    /// Exchange matrix rows 0,1 with rows 2,3 (the two 128-bit halves).
+    #[inline(always)]
+    unsafe fn swap_row_pairs(self) -> C16 {
+        C16(_mm256_permute2x128_si256::<0x01>(self.0, self.0))
+    }
+    /// Exchange matrix row 0 with 1 and row 2 with 3 (in-lane).
+    #[inline(always)]
+    unsafe fn swap_rows_in_pair(self) -> C16 {
+        C16(_mm256_shuffle_epi32::<0x4E>(self.0))
+    }
     #[inline(always)]
     unsafe fn rotate_cols(self) -> C16 {
         C16(_mm256_permute4x64_epi64::<0b00111001>(self.0))
@@ -530,35 +551,6 @@ unsafe fn triad_message(x: C16) -> C16 {
     ))
 }
 
-/// Hidden singles over the exactly-one clauses along matrix rows or columns
-/// (depending on the rotate), OR'd into `assertions`.
-/// `r1`, `r2`, `r3` are the three rotations of `cells` along the axis being
-/// scanned, passed in rather than chained: a candidate present in exactly one
-/// of the four is a hidden single.
-///
-/// `two_or_more` accumulates serially rather than as a balanced tree. The
-/// tree is one level shallower for the same seven operations and looks like
-/// the better choice, but it keeps all three rotations plus four partials
-/// live at once; measured, it pushed the loop from 77 to 81 instructions
-/// through rematerialization and ran ~0.7% slower. The accumulation retires
-/// each rotation as it goes.
-#[inline(always)]
-unsafe fn gather_clause_assertions(
-    cells: C16,
-    r1: C16,
-    r2: C16,
-    r3: C16,
-    assertions: C16,
-) -> C16 {
-    let mut one_or_more = cells;
-    let mut two_or_more = cells.and(r1);
-    one_or_more = one_or_more.or(r1);
-    two_or_more = one_or_more.and(r2).or(two_or_more);
-    one_or_more = one_or_more.or(r2);
-    two_or_more = one_or_more.and(r3).or(two_or_more);
-    cells.and_not(two_or_more).or(assertions)
-}
-
 /// Turn newly asserted literals into further box eliminations plus band
 /// elimination messages. See the port source for the full derivation.
 #[inline(always)]
@@ -571,24 +563,31 @@ unsafe fn assertions_to_eliminations(
     v_band_eliminations: &mut C8,
 ) {
     let cell_assertions_only = assertions.and(c16(&CELL3X3_MASK));
-    // Broadcast assertions across their rows and columns.
-    // Same tree treatment as across_cols below, though the payoff is smaller
-    // here: in-lane row rotations are 1-cycle, so this trades one op for one
-    // cycle rather than three.
-    let ar1 = cell_assertions_only.rotate_rows();
-    let ar2 = cell_assertions_only.rotate_rows2();
-    let ar3 = cell_assertions_only.rotate_rows3();
-    let across_rows = cell_assertions_only.or(ar1).or(ar2.or(ar3));
+    // Row broadcast. A matrix row is exactly one 64-bit lane, so a two-step
+    // shift-and-or carries each row's union up to its top element -- the
+    // horizontal triad, the only lane that needs it, since inside the 3x3 the
+    // row union is a subset of the box union that `new_box_elims` already
+    // takes. The lower elements are left holding prefix unions, which are
+    // subsets of that same box union and so change nothing.
+    //
+    // Four operations instead of three shuffles and three ors, and shifts
+    // issue on ports the shuffles are competing for.
+    let t = cell_assertions_only.or(cell_assertions_only.shift_rows_up2());
+    let across_rows = t.or(t.shift_rows_up1());
     // Rotate three ways off the same source and OR as a balanced tree. The
     // obvious `x |= rot(x)` log-reduction is one shuffle cheaper, but it
     // chains permute -> or -> permute -> or, and a cross-lane permute costs 3
     // cycles: 8 cycles of latency against 5 for three independent permutes
     // plus a two-level OR. This sits on the loop-carried critical path, where
     // latency is worth more than the extra op.
-    let ac1 = cell_assertions_only.rotate_cols();
-    let ac2 = cell_assertions_only.rotate_cols2();
-    let ac3 = cell_assertions_only.rotate_cols3();
-    let across_cols = cell_assertions_only.or(ac1).or(ac2.or(ac3));
+    // Column broadcast. A matrix column is one element position repeated in
+    // each of the four 64-bit lanes, so folding the register in half twice --
+    // once across the 128-bit halves, once across the two lanes inside each
+    // half -- unions all four rows into every row. Two shuffles and two ors
+    // rather than three cross-lane permutes and three ors, and the second
+    // fold is an in-lane `vpshufd` rather than another `vpermq`.
+    let half = cell_assertions_only.or(cell_assertions_only.swap_row_pairs());
+    let across_cols = half.or(half.swap_rows_in_pair());
     // The 3x3 submatrix eliminates an asserted digit everywhere in the box;
     // margins pick up row/col broadcasts; asserted cells eliminate all bits.
     let new_box_elims = across_cols
@@ -596,8 +595,11 @@ unsafe fn assertions_to_eliminations(
         .or(across_cols.shuffle(c16(&ROW_ROTATE_3X3_2)))
         .or(across_rows)
         .or(cell_assertions_only.which_nonzero());
-    // Keep the asserted candidate itself in its own cell.
-    *box_eliminations = new_box_elims.xor(cell_assertions_only).or(*box_eliminations);
+    // Keep the asserted candidate itself in its own cell. This replaces the
+    // caller's mask rather than accumulating into it: the box has already had
+    // every earlier elimination applied, so re-ORing them in only lengthens
+    // the value the next `and_not` waits on.
+    *box_eliminations = new_box_elims.xor(cell_assertions_only);
 
     // Negative triad assertions kill the configurations placing the digit
     // there (shift 0); asserted cells imply positive triads, killing the
@@ -679,22 +681,32 @@ unsafe fn box_fixpoint(state: &mut TState, box_idx: usize, candidates: C16) -> b
         }
         // Literal assertions: lanes at their minimum assert everything left,
         // plus hidden singles along the exactly-one row/column clauses.
+        //
+        // A lane asserts candidate `d` when it is at its cardinality minimum,
+        // or when no other lane of its matrix row still holds `d`, or none of
+        // its matrix column does. Writing `R` and `C` for the union of a
+        // lane's three row-peers and three column-peers, that is
+        //
+        //     cells & (triggered | ~R | ~C)  ==  cells & ~(R & C & ~triggered)
+        //
+        // which is the whole step in three logic operations on top of the six
+        // rotations. The peer union is also all the row/column scan needs:
+        // the previous form built, per lane, the candidates appearing in two
+        // or more lanes of the group -- a strictly stronger quantity, since a
+        // candidate the lane itself does not hold cannot survive the final
+        // `cells &` anyway. Same assertions, nine fewer vector operations,
+        // and the dependency chain drops from a six-deep serial accumulation
+        // to a two-level OR tree off the rotations.
         let triggered = counts.which_equal(box_minimums);
-        let mut assertions = cells.and(triggered);
-        assertions = gather_clause_assertions(
-            cells,
-            cells.rotate_rows(),
-            cells.rotate_rows2(),
-            cells.rotate_rows3(),
-            assertions,
-        );
-        assertions = gather_clause_assertions(
-            cells,
-            cells.rotate_cols(),
-            cells.rotate_cols2(),
-            cells.rotate_cols3(),
-            assertions,
-        );
+        let row_peers = cells
+            .rotate_rows()
+            .or(cells.rotate_rows2())
+            .or(cells.rotate_rows3());
+        let col_peers = cells
+            .rotate_cols()
+            .or(cells.rotate_cols2())
+            .or(cells.rotate_cols3());
+        let assertions = cells.and_not(row_peers.and(col_peers).and_not(triggered));
 
         // Loop exit. Everything downstream -- the box's own elimination
         // closure and both band messages -- is a function of `assertions`
@@ -868,7 +880,7 @@ const NONE: u32 = u32::MAX;
 /// with the fewest configurations, preferring 2, then 3, then more. Returns
 /// (band 0..6 or NONE, digit mask replicated across config lanes).
 #[inline]
-unsafe fn choose_band_and_value(state: &TState) -> (u32, C8) {
+unsafe fn choose_band_and_value(state: &TState) -> (u32, C8, bool) {
     // A fixed band has exactly 9 configuration bits (one per digit).
     let counts = [
         state.bands[0][0].configurations.popcount() as u16,
@@ -882,7 +894,7 @@ unsafe fn choose_band_and_value(state: &TState) -> (u32, C8) {
     ];
     let config_minpos = c8(&counts).minpos_after_sub(10);
     if config_minpos & 0xff00 != 0 {
-        return (NONE, C8::zero());
+        return (NONE, C8::zero(), false);
     }
     let best_band = config_minpos >> 16;
     // SAFETY: best_band < 6 -- fixed bands and padding lanes carry huge
@@ -920,13 +932,13 @@ unsafe fn choose_band_and_value(state: &TState) -> (u32, C8) {
 
     let only_two = two.and_not(three);
     if !only_two.all_zero() {
-        (best_band, only_two.low_bit_per_lane())
+        (best_band, only_two.low_bit_per_lane(), true)
     } else {
         let only_three = three.and_not(four);
         if !only_three.all_zero() {
-            (best_band, only_three.low_bit_per_lane())
+            (best_band, only_three.low_bit_per_lane(), false)
         } else {
-            (best_band, four.low_bit_per_lane())
+            (best_band, four.low_bit_per_lane(), false)
         }
     }
 }
@@ -945,6 +957,7 @@ impl Solver {
         &mut self,
         band_idx: usize,
         value_mask: C8,
+        pair: bool,
         state: &mut TState,
     ) {
         #[cfg(feature = "stats")]
@@ -952,12 +965,22 @@ impl Solver {
             self.guesses += 1;
         }
         let value_configurations = state.band(VERTICAL, band_idx).configurations.and(value_mask);
-        // Try the lowest configuration by eliminating the others...
-        let mut copy = *state;
         let assignment_elims = value_configurations.clear_low_bit();
+        let negation_elims = value_configurations.xor(assignment_elims);
+        // Child order. When the digit has exactly two configurations both
+        // children are commitments and the order is a pure heuristic:
+        // exploring the higher configuration first measured ~5% faster on the
+        // deep-search corpora. With three or more, the commit child is the
+        // stronger constraint and trying it first stays better.
+        let (first, second) = if pair {
+            (negation_elims, assignment_elims)
+        } else {
+            (assignment_elims, negation_elims)
+        };
+        let mut copy = *state;
         {
             let b = copy.band(VERTICAL, band_idx);
-            b.eliminations = b.eliminations.or(assignment_elims);
+            b.eliminations = b.eliminations.or(first);
         }
         if band_eliminate::<VERTICAL>(&mut copy, band_idx, 0) {
             self.count_solutions(&mut copy);
@@ -965,11 +988,9 @@ impl Solver {
                 return;
             }
         }
-        // ...then rule it out.
-        let negation_elims = value_configurations.xor(assignment_elims);
         {
             let b = state.band(VERTICAL, band_idx);
-            b.eliminations = b.eliminations.or(negation_elims);
+            b.eliminations = b.eliminations.or(second);
         }
         if band_eliminate::<VERTICAL>(state, band_idx, 0) {
             self.count_solutions(state);
@@ -977,7 +998,7 @@ impl Solver {
     }
 
     unsafe fn count_solutions(&mut self, state: &mut TState) {
-        let (band, value_mask) = choose_band_and_value(state);
+        let (band, value_mask, pair) = choose_band_and_value(state);
         if band == NONE {
             // All bands fixed: this is a solution.
             self.num_solutions += 1;
@@ -985,9 +1006,9 @@ impl Solver {
                 self.solution.write(*state);
             }
         } else if band < 3 {
-            self.branch_on_band_and_value::<0>(band as usize, value_mask, state);
+            self.branch_on_band_and_value::<0>(band as usize, value_mask, pair, state);
         } else {
-            self.branch_on_band_and_value::<1>(band as usize - 3, value_mask, state);
+            self.branch_on_band_and_value::<1>(band as usize - 3, value_mask, pair, state);
         }
     }
 }
