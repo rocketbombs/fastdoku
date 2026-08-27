@@ -1,0 +1,3 @@
+# Shell scripts must keep LF endings so they run on the Linux and macOS
+# runners after a checkout from a CRLF working copy.
+*.sh text eol=lf
