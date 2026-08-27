@@ -1,0 +1,119 @@
+name: portability
+
+# Benchmarks fastdoku against tdoku, tdoku+fastpath and rust_sudoku on the
+# stock GitHub runners, to measure how much of the solver's lead survives
+# leaving its development machine (Zen 3 / Windows / MSVC).
+#
+# Runner CPUs are shared virtual machines, so these numbers are noisier than
+# the README's bare-metal table and should be read as ratios between solvers
+# measured in the same job, never as absolute throughput.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "bench/**"
+      - ".github/workflows/portability.yml"
+
+jobs:
+  bench:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  label: "linux-x86_64" }
+          - { os: windows-latest, label: "windows-x86_64" }
+          - { os: macos-13,       label: "macos-x86_64" }
+          - { os: macos-latest,   label: "macos-arm64" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Two builds: one tuned to the runner (target-cpu=native, from
+      # .cargo/config.toml) and one generic, to separate "we lost Zen 3" from
+      # "we lost AVX2 entirely".
+      - name: Build fastdoku (native)
+        shell: bash
+        run: cargo build --release
+
+      - name: Build fastdoku (portable)
+        shell: bash
+        env:
+          RUSTFLAGS: ""
+        run: cargo build --release --target-dir target-portable
+
+      - name: Test
+        shell: bash
+        run: cargo test --release
+
+      - name: Report build configuration
+        shell: bash
+        run: |
+          ./target/release/fastdoku* bench data/gen500.txt --rounds 1 --limit 10 || true
+          echo "arch: $(uname -m)  os: $(uname -s)"
+
+      - name: Install clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+
+      - name: Fetch tdoku and its corpora
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/t-dillon/tdoku.git "$RUNNER_TEMP/tdoku"
+          cd "$RUNNER_TEMP/tdoku"
+          # Only the corpora the CI run uses; puzzles1 is 82 MB and
+          # puzzles4 175 MB unzipped, so the big two are sampled or skipped.
+          unzip -o -q data.zip \
+            data/puzzles0_kaggle \
+            data/puzzles1_unbiased \
+            data/puzzles2_17_clue \
+            data/puzzles3_magictour_top1465 \
+            data/puzzles5_forum_hardest_1905_11+ \
+            data/puzzles6_forum_hardest_1106 \
+            data/puzzles7_serg_benchmark
+          ls -la data/
+
+      - name: Build tdoku (x86 only)
+        shell: bash
+        continue-on-error: true
+        run: |
+          chmod +x bench/build_tdoku.sh
+          TDOKU_DIR="$RUNNER_TEMP/tdoku" CXX=clang++ ./bench/build_tdoku.sh
+
+      # rust_sudoku is AGPL, so it is built as a standalone crate from the
+      # harness this repo ships rather than being a dependency.
+      - name: Build rust_sudoku harness
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd "$RUNNER_TEMP"
+          cargo new --bin rsbench
+          cd rsbench
+          cargo add sudoku@0.8
+          # strip a possible UTF-8 BOM
+          sed '1s/^\xEF\xBB\xBF//' "$GITHUB_WORKSPACE/bench/rust_sudoku_bench.rs" > src/main.rs
+          printf '\n[profile.release]\nlto = "fat"\ncodegen-units = 1\n' >> Cargo.toml
+          RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+      - name: Benchmark
+        shell: bash
+        run: |
+          chmod +x bench/ci_bench.sh
+          EXT=""; [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+          RS="$RUNNER_TEMP/rsbench/target/release/rsbench$EXT"
+          [ -x "$RS" ] || RS=""
+          DATA="$RUNNER_TEMP/tdoku/data" \
+          NATIVE_BIN="target/release/fastdoku$EXT" \
+          PORTABLE_BIN="target-portable/release/fastdoku$EXT" \
+          RSBENCH="$RS" \
+          ./bench/ci_bench.sh | tee "result-${{ matrix.label }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.label }}
+          path: result-${{ matrix.label }}.txt
