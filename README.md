@@ -3,12 +3,17 @@
 A complete sudoku solver in Rust. Solves any valid 9x9 grid, proves
 uniqueness, counts solutions to a limit, and generates minimal puzzles.
 
-It is **the fastest solver in this comparison on all eight of tdoku's
-benchmark corpora**, against both tdoku — the strongest of the field on hard
-puzzles — and [rust_sudoku](https://github.com/Emerentius/sudoku), the
-strongest on easy ones. Against whichever of the two is faster on a given
-corpus the margin runs 1.06x to 1.63x; against tdoku alone, 1.21x to 2.18x.
-Every number below is measured on one machine with one harness.
+On x86-64 it is **the fastest solver in this comparison on all eight of
+tdoku's benchmark corpora**, against both tdoku — the strongest of the field
+on hard puzzles — and [rust_sudoku](https://github.com/Emerentius/sudoku),
+the strongest on easy ones. Against whichever of the two is faster on a
+given corpus the margin runs 1.06x to 1.63x; against tdoku alone, 1.21x to
+2.18x. Every number below is measured on one machine with one harness.
+
+That lead is x86-specific, and partly Windows-specific. On Apple Silicon,
+where there is no AVX2 and the SIMD engine does not exist, rust_sudoku is
+the faster solver — see [Portability](#portability-other-machines-other-abis),
+which measures all of this on stock CI runners rather than asserting it.
 
 Two engines share the work:
 
@@ -73,6 +78,83 @@ found is engine-dependent, and fastdoku's checksum matches rust_sudoku's,
 since the jcz engine makes the same branching choices. Every returned grid
 is additionally validated cell by cell, and the five engines are
 cross-validated against each other on every solve in the test suite.
+
+### Portability: other machines, other ABIs
+
+Everything above is one Zen 3 Windows machine, and two of the triad engine's
+optimizations are Windows ABI artifacts. The
+[portability workflow](.github/workflows/portability.yml) re-runs the same
+comparison on stock GitHub runners so the machine-specific part of the lead
+is measured rather than guessed.
+
+Read these as ratios between solvers measured in the same job, never as
+absolute throughput: runners are shared VMs and drift ~10% run to run, the
+corpora are sampled to bound CI time, and — unlike the table above — nothing
+is PGO-built. fastdoku is built twice per runner, tuned (`target-cpu=native`)
+and generic, to separate "lost Zen 3 tuning" from "lost AVX2 entirely".
+
+**linux-x86_64** — all five solvers, all checksums agreeing:
+
+| corpus | fastdoku | portable | tdoku | +fastpath | rust_sudoku |
+|--------|---------:|---------:|------:|----------:|------------:|
+| kaggle          |   **746** | 1187 | 1360 | 1331 | 1190 |
+| serg            |  **1791** | 2233 | 2252 | 2192 | 2094 |
+| unbiased        |  **1945** | 2540 | 3492 | 3422 | 2264 |
+| 17_clue         |  **1947** | 2629 | 3725 | 3614 | 2294 |
+| magictour       |  **6941** | 8598 | 7251 | 7119 | 7656 |
+| hardest_11+     | **29319** | 40569 | 31871 | 31664 | 35335 |
+| hardest_1106    | **43498** | 52389 | 51296 | 51018 | 45206 |
+
+**windows-x86_64** — all five solvers, all checksums agreeing:
+
+| corpus | fastdoku | portable | tdoku | +fastpath | rust_sudoku |
+|--------|---------:|---------:|------:|----------:|------------:|
+| kaggle          |   **811** | 1398 | 1763 | 1529 | 1297 |
+| serg            |  **1920** | 2657 | 2819 | 2428 | 2249 |
+| unbiased        |  **2134** | 3041 | 4568 | 3949 | 2473 |
+| 17_clue         |  **2133** | 3095 | 4841 | 4143 | 2537 |
+| magictour       |  **7573** | 9917 | 9285 | 8220 | 8339 |
+| hardest_11+     | **31998** | 47669 | 40167 | 36254 | 38327 |
+| hardest_1106    | **46972** | 61184 | 64200 | 58166 | 48894 |
+
+**macos-arm64** — tdoku's SIMD layer is x86-only (SSE/AVX/AVX-512, no NEON
+path), so it cannot be built here at all; fastdoku's triad engine likewise
+is not compiled, and `auto` runs jcz with every fallback taken — scalar
+condense, scalar sweep, scalar extraction, no vector clue scan:
+
+| corpus | fastdoku | portable | tdoku | +fastpath | rust_sudoku |
+|--------|---------:|---------:|------:|----------:|------------:|
+| kaggle          | 1187 | 1183 | n/a | n/a |  **1061** |
+| serg            | 2244 | 2579 | n/a | n/a |  **2143** |
+| unbiased        | 2740 | 2942 | n/a | n/a |  **2350** |
+| 17_clue         | 3204 | 2870 | n/a | n/a |  **2238** |
+| magictour       | 9565 | 9954 | n/a | n/a |  **7474** |
+| hardest_11+     | 43828 | 42873 | n/a | n/a | **32924** |
+| hardest_1106    | 56098 | 57977 | n/a | n/a | **44268** |
+
+Three things fall out, one of them unwelcome:
+
+**The Windows-specific claims check out.** The hot/cold split is worth 10-16%
+on the Windows runner (tdoku 1763 vs fastpath 1529 on kaggle, 4568 vs 3949
+on unbiased) and about 2% on Linux (1360 vs 1331, 3492 vs 3422) — which is
+exactly what "Windows x64 makes xmm6-xmm15 callee-saved" predicts, measured
+on tdoku's own source rather than ours.
+
+**The lead survives on x86 but compresses.** fastdoku is still fastest of
+the four on every corpus on both x86 runners, but against the best of the
+other three the hard-corpus margins fall from 1.10x/1.18x/1.06x on the
+development machine to 1.03x/1.08x/1.04x on Linux. Losing the Windows ABI
+work costs most of it; the rest is that these runners are not Zen 3. The
+easy-corpus margins barely move (1.63x -> 1.59x on kaggle), because those
+are the jcz engine's, and jcz is ordinary scalar code.
+
+**On Apple Silicon, rust_sudoku is the better solver** — by 4% to 43%. Two
+compounding reasons: the triad engine is gone entirely, so hard puzzles fall
+to jcz, which is 25-35% slower there even on x86; and jcz's own fast paths
+(`pext` condense, AVX2 band sweep and extraction) all degrade to scalar
+fallbacks. Native and generic builds are within noise of each other on ARM,
+confirming there is no machine-specific tuning left to lose. Porting the
+fallbacks to NEON is the obvious next step and has not been done.
 
 ### Where the time goes, and why a hybrid
 
@@ -144,6 +226,12 @@ clang on PATH run `.\bench\build_tdoku.ps1` and `.\bench\compare.ps1`. Set
 `TDOKU_DIR` if the checkout isn't at `C:\Claude\tdoku-ref`, and `RSBENCH` to
 a built rust_sudoku harness to include it. Only the comparison needs clang
 and tdoku; the solver needs neither.
+
+On POSIX systems `bench/build_tdoku.sh` and `bench/ci_bench.sh` do the same
+job and are what the portability workflow runs; `ci_bench.sh` also checks
+that every solver present agrees on the solution checksums, since a
+divergence on another platform would be a portability bug rather than a
+timing.
 [`bench/rust_sudoku_bench.rs`](bench/rust_sudoku_bench.rs) documents how to
 build that harness (it is AGPL, so it is not a dependency of this crate and
 none of its code is used here).
@@ -250,8 +338,11 @@ the common path never enters a frame. This is the single largest difference
 and it is why the results table carries a `tdoku+fastpath` column: it applies
 cleanly to tdoku's own source
 ([`bench/tdoku_fastpath.cc`](bench/tdoku_fastpath.cc)) and recovers most of
-tdoku's deficit. On SysV targets, where no vector registers are callee-saved,
-the effect should be much smaller.
+tdoku's deficit.
+
+The CI runs confirm the mechanism on tdoku itself: backporting the split is
+worth 10-16% on the Windows runner and about 2% on Linux, where SysV leaves
+no vector registers callee-saved and there is no prologue to avoid.
 
 ### SysV calling convention for the recursive body — ~2%, Windows-specific
 
