@@ -26,7 +26,6 @@ jobs:
         include:
           - { os: ubuntu-latest,  label: "linux-x86_64" }
           - { os: windows-latest, label: "windows-x86_64" }
-          - { os: macos-13,       label: "macos-x86_64" }
           - { os: macos-latest,   label: "macos-arm64" }
 
     steps:
@@ -80,7 +79,6 @@ jobs:
 
       - name: Build tdoku (x86 only)
         shell: bash
-        continue-on-error: true
         run: |
           chmod +x bench/build_tdoku.sh
           TDOKU_DIR="$RUNNER_TEMP/tdoku" CXX=clang++ ./bench/build_tdoku.sh
@@ -89,7 +87,6 @@ jobs:
       # harness this repo ships rather than being a dependency.
       - name: Build rust_sudoku harness
         shell: bash
-        continue-on-error: true
         run: |
           cd "$RUNNER_TEMP"
           cargo new --bin rsbench
@@ -114,6 +111,7 @@ jobs:
           ./bench/ci_bench.sh | tee "result-${{ matrix.label }}.txt"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: result-${{ matrix.label }}
           path: result-${{ matrix.label }}.txt

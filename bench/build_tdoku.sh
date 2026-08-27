@@ -29,23 +29,39 @@ fi
 
 mkdir -p "$out"
 
+# Windows toolchains produce foo.exe, and the benchmark harness looks for that
+# name, so ask for it explicitly rather than relying on the driver.
+ext=""
+case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) ext=".exe" ;; esac
+
 # -march=native so tdoku gets the same machine-specific tuning the Rust build
 # gets from target-cpu=native, and LTO so it gets the same whole-program
 # optimization fastdoku gets from fat LTO. Keeps the comparison fair.
 common=(-O3 -march=native -std=c++17 -DNDEBUG -w -I"$tdoku/include" -I"$tdoku/src")
 
+# clang needs an LTO-capable linker and will not choose one itself: on Windows
+# it stops with "LTO requires -fuse-ld=lld", while Apple's ld64 does LTO
+# natively and ships no lld to ask for. Probe instead of guessing per-platform.
+link=()
+probe="$(mktemp -d)"
+printf 'int main(){return 0;}\n' > "$probe/t.cc"
+if "$cxx" -flto -fuse-ld=lld "$probe/t.cc" -o "$probe/t$ext" >/dev/null 2>&1; then
+    link+=(-fuse-ld=lld)
+fi
+rm -rf "$probe"
+
 for src in solver_dpll_triad_simd util; do
     "$cxx" "${common[@]}" -flto -c "$tdoku/src/$src.cc" -o "$out/$src.o"
 done
-"$cxx" "${common[@]}" -flto "$here/tdoku_bench.cc" \
-    "$out/solver_dpll_triad_simd.o" "$out/util.o" -o "$out/tdoku_bench"
+"$cxx" "${common[@]}" -flto "${link[@]}" "$here/tdoku_bench.cc" \
+    "$out/solver_dpll_triad_simd.o" "$out/util.o" -o "$out/tdoku_bench$ext"
 
 # Also build tdoku with the hot/cold split fastdoku uses (tdoku_fastpath.cc),
 # so the comparison isolates that one optimization from everything else.
 if [ -f "$here/tdoku_fastpath.cc" ]; then
     "$cxx" "${common[@]}" -c "$here/tdoku_fastpath.cc" -o "$out/tdoku_fastpath.o"
-    "$cxx" "${common[@]}" -flto "$here/tdoku_bench.cc" \
-        "$out/tdoku_fastpath.o" "$out/util.o" -o "$out/tdoku_fastpath"
+    "$cxx" "${common[@]}" -flto "${link[@]}" "$here/tdoku_bench.cc" \
+        "$out/tdoku_fastpath.o" "$out/util.o" -o "$out/tdoku_fastpath$ext"
 fi
 
-echo "built $out/tdoku_bench"
+echo "built $out/tdoku_bench$ext"
