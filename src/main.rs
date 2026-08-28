@@ -63,7 +63,7 @@ type SolveFn = fn(&[u8; 81]) -> Option<[u8; 81]>;
 /// the triad hot path it perturbs that engine's LTO codegen by ~12% on the
 /// hard corpora.
 fn auto_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(triad_engine)]
     {
         match fastdoku::jcz::run(
             clues,
@@ -81,7 +81,7 @@ fn auto_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
             fastdoku::jcz::Outcome::Deferred => triad_solve_grid(clues),
         }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(not(triad_engine))]
     {
         jcz_solve_grid(clues)
     }
@@ -89,7 +89,7 @@ fn auto_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
 
 /// `auto` for solution counting; see `auto_solve_grid`.
 fn auto_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(triad_engine)]
     {
         match fastdoku::jcz::run(
             clues,
@@ -101,7 +101,7 @@ fn auto_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
             fastdoku::jcz::Outcome::Deferred => triad_count_solutions(clues, limit),
         }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(not(triad_engine))]
     {
         jcz_count_solutions(clues, limit)
     }
@@ -180,7 +180,7 @@ fn cmd_bench(file: &str, rounds: usize, threads: usize, engine: &str, limit: usi
         "jcz" => jcz_solve_grid,
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         "simd" => simd_solve_grid,
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(triad_engine)]
         "triad" => triad_solve_grid,
         _ => auto_solve_grid,
     };

@@ -292,17 +292,55 @@ fn shrink_band(m: u32) -> u32 {
     unsafe { _pext_u32(m | (m >> 1) | (m >> 2), 0o111_111_111) }
 }
 
+/// MINIROW_OCC[x]: for a 9-bit row of a band, which of its three minirows
+/// hold anything, as a 3-bit mask.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+static MINIROW_OCC: [u8; 512] = build_minirow_occ();
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+const fn build_minirow_occ() -> [u8; 512] {
+    let mut t = [0u8; 512];
+    let mut x = 0usize;
+    while x < 512 {
+        let mut i = 0;
+        while i < 3 {
+            if (x >> (3 * i)) & 7 != 0 {
+                t[x] |= 1 << i;
+            }
+            i += 1;
+        }
+        x += 1;
+    }
+    t
+}
+
+/// Without `pext`, three *independent* byte lookups, one per row of the
+/// band, shifted into place.
+///
+/// The obvious portable form -- nine shift-mask-or steps, or the canonical
+/// JCZSolve chain of three dependent table loads -- both put a serial chain
+/// where this result cannot afford one: it feeds straight into the
+/// `CLOSED_CELLS` lookup on the critical path of every subband update. Here
+/// the three loads issue together off three independent extracts, so the
+/// whole condense is one shift plus one load plus the combine, and the
+/// tables absorb the `m | m>>1 | m>>2` folding as well (an entry is indexed
+/// by a raw 9-bit row, not a pre-folded one).
+///
+/// A table-free alternative exists -- two chained multiplies gather bits at
+/// stride 3 without collisions (`* 0x15`, mask, `* 0x1041`) -- and was
+/// rejected: seven instructions but two dependent 3-cycle multiplies, which
+/// is longer than the load latency it would replace.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
 #[inline(always)]
 fn shrink_band(m: u32) -> u32 {
-    let f = m | (m >> 1) | (m >> 2);
-    let mut s = 0;
-    let mut i = 0;
-    while i < 9 {
-        s |= ((f >> (3 * i)) & 1) << i;
-        i += 1;
+    // SAFETY: each index is masked to 9 bits, and `m` is a 27-bit band mask
+    // so the third extract is in range too.
+    unsafe {
+        let r0 = *MINIROW_OCC.get_unchecked((m & 0x1ff) as usize) as u32;
+        let r1 = *MINIROW_OCC.get_unchecked(((m >> 9) & 0x1ff) as usize) as u32;
+        let r2 = *MINIROW_OCC.get_unchecked(((m >> 18) & 0x1ff) as usize) as u32;
+        r0 | (r1 << 3) | (r2 << 6)
     }
-    s
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +405,7 @@ impl State {
         // clue_bits[digit * 3 + band]: the clue cells of that digit in that band.
         let mut clue_bits = [0u32; 30];
 
-        let mut visit = |cell: usize| {
+        let visit = |cell: usize| {
             // SAFETY: cell < 81, and clue digits are 1..=9 by construction of
             // the scan below, so both indices are in range.
             unsafe {
@@ -378,55 +416,19 @@ impl State {
             }
         };
 
-        let n_clues;
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        {
-            // Clue positions as a bitmask via three overlapping 32-byte
-            // compares; the scan then touches only clue cells.
-            #[cfg(target_arch = "x86_64")]
-            use core::arch::x86_64::*;
-            // SAFETY: the three loads cover bytes 0..32, 32..64 and 49..81
-            // of an 81-byte array.
-            let (m_a, m_b, m_c) = unsafe {
-                let zero = _mm256_setzero_si256();
-                let p = clues.as_ptr();
-                (
-                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(
-                        _mm256_loadu_si256(p as *const __m256i),
-                        zero,
-                    )) as u32,
-                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(
-                        _mm256_loadu_si256(p.add(32) as *const __m256i),
-                        zero,
-                    )) as u32,
-                    _mm256_movemask_epi8(_mm256_cmpeq_epi8(
-                        _mm256_loadu_si256(p.add(49) as *const __m256i),
-                        zero,
-                    )) as u32,
-                )
-            };
-            let mut lo = !(m_a as u64 | (m_b as u64) << 32);
-            let mut hi = (!m_c >> 15) & 0x1ffff;
-            n_clues = lo.count_ones() + hi.count_ones();
-            while lo != 0 {
-                visit(lo.trailing_zeros() as usize);
-                lo &= lo - 1;
-            }
-            while hi != 0 {
-                visit(64 + hi.trailing_zeros() as usize);
-                hi &= hi - 1;
-            }
+        // Clue positions as a bitmask, so the scan touches only clue cells
+        // and its control flow does not depend on where they are.
+        // SAFETY: every bit set in the masks is a cell index below 81.
+        let (mut lo, mut hi) = unsafe { crate::clue_scan::clue_masks(clues) };
+        let n_clues = lo.count_ones() + hi.count_ones();
+        let mut visit = visit;
+        while lo != 0 {
+            visit(lo.trailing_zeros() as usize);
+            lo &= lo - 1;
         }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-        {
-            let mut n = 0;
-            for cell in 0..81 {
-                if clues[cell] != 0 {
-                    visit(cell);
-                    n += 1;
-                }
-            }
-            n_clues = n;
+        while hi != 0 {
+            visit(64 + hi.trailing_zeros() as usize);
+            hi &= hi - 1;
         }
 
         let mut unit_bits = 0u32;
@@ -564,7 +566,37 @@ impl State {
         dirty
     }
 
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    /// NEON has no 32-bit `movemask`, so the eight comparison results are
+    /// narrowed to 16-bit lanes, masked against bit weights and summed with
+    /// one `addv` -- five operations for the mask against x86's one, but
+    /// still against roughly seven scalar instructions per subband.
+    ///
+    /// SAFETY: as above.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn sweep_band(&mut self, base: usize, keep: u32) -> u32 {
+        use core::arch::aarch64::*;
+        static WEIGHTS: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+        let p = self.poss.as_mut_ptr().add(base);
+        let k = vdupq_n_u32(keep);
+        let (o0, o1) = (vld1q_u32(p), vld1q_u32(p.add(4)));
+        let (n0, n1) = (vandq_u32(o0, k), vandq_u32(o1, k));
+        vst1q_u32(p, n0);
+        vst1q_u32(p.add(4), n1);
+        let same = vcombine_u16(vmovn_u32(vceqq_u32(o0, n0)), vmovn_u32(vceqq_u32(o1, n1)));
+        let same_bits = vaddvq_u16(vandq_u16(same, vld1q_u16(WEIGHTS.as_ptr()))) as u32;
+        let mut dirty = (!same_bits & 0xff) << base;
+        let ov = *p.add(8);
+        let nv = ov & keep;
+        *p.add(8) = nv;
+        dirty |= ((nv != ov) as u32) << (base + 8);
+        dirty
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        target_arch = "aarch64"
+    )))]
     #[inline(always)]
     unsafe fn sweep_band(&mut self, base: usize, keep: u32) -> u32 {
         let mut dirty = 0;
@@ -631,24 +663,61 @@ impl State {
             }
             self.pairs[band] = c2 ^ c3;
             let mut singles = (c1 ^ c2) & self.unsolved[band];
+            if singles == 0 {
+                continue;
+            }
+            // Which digit is the single? The obvious answer -- scan the
+            // band's nine subbands for the one holding this cell -- runs
+            // 1..9 iterations with the trip count set by the digit, which is
+            // as good as random, so it mispredicts on nearly every single
+            // placed. Instead the digit's *index* is bit-sliced across four
+            // masks: `slice[k]` carries, at each cell, bit k of the index of
+            // every digit still possible there, so at a cell where only one
+            // digit is possible the four masks spell out exactly that
+            // digit's index. Reading it back is four shifts and three ors,
+            // branchless.
+            //
+            // Twelve ors to build, so it is built here rather than in the
+            // accumulation above: on the hard corpora most calls place
+            // nothing and would never use it.
+            //
+            // SAFETY: base + 8 <= 26 indexes `poss`.
+            let sl = unsafe {
+                let p = |d: usize| *self.poss.get_unchecked(base + d);
+                [
+                    p(1) | p(3) | p(5) | p(7), // digits with bit 0 of the index
+                    p(2) | p(3) | p(6) | p(7), // bit 1
+                    p(4) | p(5) | p(6) | p(7), // bit 2
+                    p(8),                      // bit 3
+                ]
+            };
             while singles != 0 {
                 let bit = singles & singles.wrapping_neg();
                 singles &= singles - 1;
                 placed = true;
-                // SAFETY: `bit` comes from a mask ANDed with ALL, so pos < 27.
+                // `bit` comes from a mask ANDed with ALL, so pos < 27.
                 let pos = bit.trailing_zeros() as usize;
-                let mut d = 0;
-                loop {
-                    if d == 9 {
+                let d = (((sl[0] >> pos) & 1)
+                    | ((sl[1] >> pos) & 1) << 1
+                    | ((sl[2] >> pos) & 1) << 2
+                    | ((sl[3] >> pos) & 1) << 3) as usize;
+                // The slices were taken before this loop placed anything, so
+                // they can be stale: an earlier placement can have cleared
+                // this cell's last candidate, which is a contradiction. The
+                // guard covers that, and keeps the index below in bounds
+                // whatever the slices said.
+                if d >= 9 {
+                    return Err(Unsat);
+                }
+                // SAFETY: base + d <= 26, and pos < 27.
+                unsafe {
+                    let cur = self.poss.get_unchecked_mut(base + d);
+                    if *cur & bit == 0 {
                         return Err(Unsat); // every digit eliminated meanwhile
                     }
-                    if self.poss[base + d] & bit != 0 {
-                        self.poss[base + d] &= unsafe { *SAME_BAND_OK.get_unchecked(pos) };
-                        self.dirty |= 1 << (base + d);
-                        break;
-                    }
-                    d += 1;
+                    *cur &= *SAME_BAND_OK.get_unchecked(pos);
                 }
+                self.dirty |= 1 << (base + d);
             }
         }
         Ok(placed)
@@ -700,7 +769,49 @@ impl State {
         }
     }
 
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    /// The same construction on NEON, over two 16-byte registers per band
+    /// instead of one 32-byte one. `vqtbl1q_u8` spreads the broadcast band
+    /// mask to one byte per cell exactly as `vpshufb` does.
+    #[cfg(target_arch = "aarch64")]
+    fn extract(&self, out: &mut [u8; 81]) {
+        use core::arch::aarch64::*;
+        static SPREAD: [u8; 32] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3,
+            3, 3, 3, 3, 3,
+        ];
+        // SAFETY: plain NEON arithmetic; the two 16-byte stores land in a
+        // 32-byte scratch buffer and 27 bytes are copied out per band.
+        unsafe {
+            let sp0 = vld1q_u8(SPREAD.as_ptr());
+            let sp1 = vld1q_u8(SPREAD.as_ptr().add(16));
+            let bits = vreinterpretq_u8_u64(vdupq_n_u64(0x8040_2010_0804_0201));
+            for band in 0..3 {
+                let mut a0 = vdupq_n_u8(0);
+                let mut a1 = vdupq_n_u8(0);
+                for d in 0..9 {
+                    let m = vreinterpretq_u8_u32(vdupq_n_u32(self.poss[band * 9 + d]));
+                    let dig = vdupq_n_u8(d as u8 + 1);
+                    // `vtst` is the whole test: the weights have one bit
+                    // per lane, so "the masked bits equal the weight" and
+                    // "the masked bits are non-zero" agree, and NEON has the
+                    // second as one instruction.
+                    let h0 = vtstq_u8(vqtbl1q_u8(m, sp0), bits);
+                    let h1 = vtstq_u8(vqtbl1q_u8(m, sp1), bits);
+                    a0 = vorrq_u8(a0, vandq_u8(h0, dig));
+                    a1 = vorrq_u8(a1, vandq_u8(h1, dig));
+                }
+                let mut buf = [0u8; 32];
+                vst1q_u8(buf.as_mut_ptr(), a0);
+                vst1q_u8(buf.as_mut_ptr().add(16), a1);
+                out[band * 27..band * 27 + 27].copy_from_slice(&buf[..27]);
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        target_arch = "aarch64"
+    )))]
     fn extract(&self, out: &mut [u8; 81]) {
         for band in 0..3 {
             for d in 0..9 {
@@ -969,6 +1080,38 @@ mod table_tests {
             }
             assert_eq!(COL_SINGLE[m], single);
             assert_eq!(NEIGH_OK[m], ok);
+        }
+    }
+
+    /// `shrink_band` must agree with its definition on every band mask, for
+    /// whichever of the three implementations this target compiled.
+    #[test]
+    fn condense_matches_definition() {
+        let reference = |m: u32| {
+            let mut s = 0;
+            for i in 0..9 {
+                if (m >> (3 * i)) & 7 != 0 {
+                    s |= 1 << i;
+                }
+            }
+            s
+        };
+        // Exhaustive over a band's 27 bits is 134M; instead sweep every
+        // single- and double-minirow pattern (which is what the hot path
+        // mostly sees) plus a large pseudorandom sample.
+        for a in 0..27u32 {
+            for b in 0..27u32 {
+                let m = (1 << a) | (1 << b);
+                assert_eq!(super::shrink_band(m), reference(m), "m = {m:o}");
+            }
+        }
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..200_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let m = (rng as u32) & super::ALL;
+            assert_eq!(super::shrink_band(m), reference(m), "m = {m:o}");
         }
     }
 }

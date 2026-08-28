@@ -1,8 +1,8 @@
 //! fastdoku — a fast, complete sudoku solver.
 //!
 //! Five engines, cross-validated against each other in the test suite:
-//! - `triad`: a port of tdoku's DPLL + triad + SIMD architecture (AVX2);
-//!   the strongest inference, fastest on hard puzzles.
+//! - `triad`: a port of tdoku's DPLL + triad + SIMD architecture, over AVX2
+//!   or NEON; the strongest inference, fastest on hard puzzles.
 //! - `jcz`: an original implementation of the JCZSolve architecture (bands
 //!   by digit, locked candidates by table lookup); the cheapest per easy
 //!   deduction, fastest on easy and typical puzzles. Scalar, portable.
@@ -20,15 +20,26 @@ pub mod band;
 
 pub mod jcz;
 
+mod clue_scan;
+
+#[cfg(triad_engine)]
+mod tvec;
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub mod simd;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+/// Gated on `cfg(triad_engine)`, which `build.rs` sets for targets with a
+/// backend for the engine's vector vocabulary: AVX2 on x86-64, NEON on
+/// aarch64.
+#[cfg(triad_engine)]
 pub mod triad;
 
 /// True when the AVX2 engine is compiled in (requires `-C target-cpu=native`
 /// or `-C target-feature=+avx2`). Otherwise the band engine is the default.
 pub const HAS_SIMD: bool = cfg!(all(target_arch = "x86_64", target_feature = "avx2"));
+
+/// True when the `triad` engine is compiled in.
+pub const HAS_TRIAD: bool = cfg!(triad_engine);
 
 pub const ALL: u16 = 0x1FF;
 
@@ -585,7 +596,8 @@ pub const HYBRID_GUESS_BUDGET: u32 = 16;
 /// Solve a puzzle given as 81 digits (0 = blank). Returns the first solution
 /// found, or `None` if the puzzle has no solution.
 ///
-/// With AVX2 this is the `triad` engine (a port of tdoku's architecture);
+/// Where the `triad` engine is available this is it (a port of tdoku's
+/// architecture, over AVX2 or NEON);
 /// otherwise the scalar `band` engine. The CLI's default `auto` engine
 /// instead routes each puzzle between `jcz` and `triad` with
 /// [`jcz::run`] — that dispatch lives in the binary because defining it
@@ -593,11 +605,11 @@ pub const HYBRID_GUESS_BUDGET: u32 = 16;
 /// the triad engine's codegen (~12% on the hard corpora).
 #[inline]
 pub fn solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(triad_engine)]
     {
         triad::solve_grid(clues)
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(not(triad_engine))]
     {
         band::solve_grid(clues)
     }
@@ -606,11 +618,11 @@ pub fn solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
 /// Count solutions up to `limit` (use limit=2 for a uniqueness check).
 #[inline]
 pub fn count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(triad_engine)]
     {
         triad::count_solutions(clues, limit)
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(not(triad_engine))]
     {
         band::count_solutions(clues, limit)
     }
@@ -638,13 +650,13 @@ pub fn band_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
 }
 
 /// DPLL+triad+SIMD engine, ported from tdoku (BSD-2-Clause).
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(triad_engine)]
 #[inline]
 pub fn triad_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
     triad::solve_grid(clues)
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(triad_engine)]
 #[inline]
 pub fn triad_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
     triad::count_solutions(clues, limit)
@@ -892,7 +904,7 @@ mod tests {
             "simd count differs on {}",
             grid_to_line(p)
         );
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(triad_engine)]
         assert_eq!(
             c_base,
             triad_count_solutions(p, 2),
@@ -900,11 +912,14 @@ mod tests {
             grid_to_line(p)
         );
         if c_base >= 1 {
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            for (name, sol) in [("simd", simd_solve_grid(p)), ("triad", triad_solve_grid(p))] {
+            let check = |name: &str, sol: Option<[u8; 81]>| {
                 let s = sol.unwrap_or_else(|| panic!("{name} found no solution"));
                 assert!(is_valid_solution(&s, p), "{name} returned an invalid grid");
-            }
+            };
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            check("simd", simd_solve_grid(p));
+            #[cfg(triad_engine)]
+            check("triad", triad_solve_grid(p));
             for (name, sol) in [
                 ("baseline", baseline_solve_grid(p)),
                 ("band", band_solve_grid(p)),

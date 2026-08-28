@@ -12,8 +12,9 @@ held every regime from trivial to extreme. Margins over whichever of the two
 is faster on a given corpus run **1.06x to 1.63x**, and the ordering
 reproduces on three different machines.
 
-**On ARM64 it does not.** Without AVX2 the SIMD engine is not compiled at
-all, and rust_sudoku is 4-43% faster. That is measured below, not assumed.
+**On ARM64 it is close.** Both engines run on NEON now; tdoku cannot be built
+there at all, and against rust_sudoku fastdoku wins four of the seven corpora
+and trails by 3-5% on the other three. That is measured below, not assumed.
 
 ## Results
 
@@ -64,26 +65,31 @@ fastdoku wins:
 
 | Corpus | Zen 3 / Windows | linux-x86_64 | windows-x86_64 | macos-arm64 |
 |--------|----------------:|-------------:|---------------:|------------:|
-| kaggle          | 1.63x | 1.59x | 1.60x | **0.89x** |
-| serg            | 1.18x | 1.17x | 1.17x | **0.95x** |
-| unbiased        | 1.16x | 1.16x | 1.16x | **0.86x** |
-| 17_clue         | 1.19x | 1.18x | 1.19x | **0.70x** |
-| magictour       | 1.10x | 1.03x | 1.09x | **0.78x** |
+| kaggle          | 1.63x | 1.59x | 1.60x | 1.30x |
+| serg            | 1.18x | 1.17x | 1.17x | 1.01x |
+| unbiased        | 1.16x | 1.16x | 1.16x | **0.97x** |
+| 17_clue         | 1.19x | 1.18x | 1.19x | **0.99x** |
+| magictour       | 1.10x | 1.03x | 1.09x | 1.02x |
 | hardest_1905    | 1.16x |   —   |   —   |     —     |
-| hardest_11+     | 1.18x | 1.08x | 1.13x | **0.75x** |
-| hardest_1106    | 1.06x | 1.04x | 1.04x | **0.79x** |
+| hardest_11+     | 1.18x | 1.08x | 1.13x | 1.08x |
+| hardest_1106    | 1.06x | 1.04x | 1.04x | **0.92x**\* |
 
 The x86 result reproduces: fastest of the four on every corpus on both x86
 runners. The hard-corpus margins compress — most of that is the Windows ABI
 work, which is worth nothing under SysV — while the easy-corpus margins
 barely move, because those belong to the scalar engine.
 
-The ARM column is the honest caveat. There is no AVX2, so the SIMD engine is
-absent and hard puzzles fall to the scalar engine, whose own fast paths
-(`pext`, vector sweeps and extraction) degrade to portable fallbacks too.
-tdoku cannot be built there at all — its SIMD layer is x86-only — so the
-comparison is against rust_sudoku alone. NEON fallbacks are the obvious
-unfinished work.
+The ARM column used to read 0.70x-0.95x: the triad engine was x86-only, so
+every hard puzzle fell through to the scalar engine, whose own fast paths
+(`pext`, vector sweeps and extraction) degraded to portable code as well.
+Both now have NEON backends, worth 1.12x to 1.54x on the same runners, and
+the corpora fastdoku still trails on are ones where the hybrid's routing
+threshold is a known compromise on x86 too. \*`hardest_1106` is 375 puzzles
+and its four runs spanned 0.90x-1.04x, so read that cell as "about even". tdoku cannot be
+built on ARM at all — its SIMD layer is x86-only — so that column compares
+against rust_sudoku alone. The ARM runner's variance is larger than the
+differences being measured, so that column is a per-corpus median of four
+runs, compared against three runs of the previous code on the same runners.
 
 Runner CPUs are shared VMs and drift ~10% run to run, the corpora are
 sampled to bound CI time, and nothing there is PGO-built, so those columns
@@ -152,9 +158,12 @@ cargo build --release
 ```
 
 `.cargo/config.toml` sets `-C target-cpu=native`, enabling the AVX2 triad
-engine and the BMI2 path in jcz; without them `auto` runs jcz with portable
-fallbacks. On Windows `.\build.ps1` adds a two-stage PGO build (`-NoPgo` to
-skip) that profiles both engines and the dispatch.
+engine and the BMI2 path in jcz on x86-64; without them the triad engine is
+not compiled and `auto` runs jcz with portable fallbacks. On aarch64 nothing
+needs enabling — NEON is architectural, and both engines use it.
+
+On Windows `.\build.ps1` adds a two-stage PGO build (`-NoPgo` to skip) that
+profiles both engines and the dispatch.
 
 To reproduce the comparison: clone tdoku, unzip its `data.zip`, then with
 clang on PATH run `.\bench\build_tdoku.ps1` and `.\bench\compare.ps1` (or
@@ -172,7 +181,14 @@ solver needs neither.
   multi-solution — asserting identical solution counts and validating every
   grid returned.
 - The jcz engine's closure tables are verified exhaustively against their
-  definition (all 512 patterns x 6 permutation matrices).
+  definition (all 512 patterns x 6 permutation matrices), and its band
+  condense against its definition on every one- and two-minirow pattern plus
+  200,000 random ones.
+- Every primitive of the triad engine's vector vocabulary is checked against
+  a scalar model of what it means, so a broken SIMD backend fails as
+  "`col_peers` is wrong" rather than as "engine N disagrees on puzzle M".
+  That is the only check on a backend that can run before the hardware
+  does.
 - `bench` verifies every solution and asserts identical checksums across
   rounds, threads and engines; `ci_bench.sh` additionally checks that every
   solver present on the platform agrees, since a divergence elsewhere would

@@ -28,258 +28,8 @@
 //! configuration versus rule it out, choosing the band with the fewest total
 //! configurations and a digit with the fewest configurations in it.
 
-use core::arch::x86_64::*;
+use crate::tvec::{band_config_counts, c16, c16_bytes, c8, ALL, CELLS_3X3, C16, C8, S0, S1, S2, S3, S4, S5, S6, XX};
 
-const ALL: u16 = 0x1ff;
-const XX: u16 = 0xffff;
-
-// Byte-pair shuffle selectors for 16-bit lanes 0..7 (pshufb operates on
-// bytes; 0xffff's high bits make pshufb emit zero).
-const S0: u16 = 0x0100;
-const S1: u16 = 0x0302;
-const S2: u16 = 0x0504;
-const S3: u16 = 0x0706;
-const S4: u16 = 0x0908;
-const S5: u16 = 0x0b0a;
-const S6: u16 = 0x0d0c;
-const S7: u16 = 0x0f0e;
-
-// ---------------------------------------------------------------------------
-// Vector wrappers: C8 = 8 x u16 (one band / half a box), C16 = 16 x u16 (a
-// box as a 4x4 matrix; lanes 0..15 row-major).
-// ---------------------------------------------------------------------------
-
-#[derive(Copy, Clone)]
-struct C8(__m128i);
-
-#[derive(Copy, Clone)]
-struct C16(__m256i);
-
-#[inline(always)]
-unsafe fn c8(a: &[u16; 8]) -> C8 {
-    C8(_mm_loadu_si128(a.as_ptr() as *const __m128i))
-}
-
-#[inline(always)]
-unsafe fn c16(a: &[u16; 16]) -> C16 {
-    C16(_mm256_loadu_si256(a.as_ptr() as *const __m256i))
-}
-
-impl C8 {
-    #[inline(always)]
-    unsafe fn all(v: u16) -> C8 {
-        C8(_mm_set1_epi16(v as i16))
-    }
-    #[inline(always)]
-    unsafe fn zero() -> C8 {
-        C8(_mm_setzero_si128())
-    }
-    #[inline(always)]
-    unsafe fn and(self, o: C8) -> C8 {
-        C8(_mm_and_si128(self.0, o.0))
-    }
-    #[inline(always)]
-    unsafe fn or(self, o: C8) -> C8 {
-        C8(_mm_or_si128(self.0, o.0))
-    }
-    #[inline(always)]
-    unsafe fn xor(self, o: C8) -> C8 {
-        C8(_mm_xor_si128(self.0, o.0))
-    }
-    /// self & !o
-    #[inline(always)]
-    unsafe fn and_not(self, o: C8) -> C8 {
-        C8(_mm_andnot_si128(o.0, self.0))
-    }
-    #[inline(always)]
-    unsafe fn shuffle(self, ctrl: C8) -> C8 {
-        C8(_mm_shuffle_epi8(self.0, ctrl.0))
-    }
-    /// Swap the two rows of a 2x4 view (64-bit halves).
-    #[inline(always)]
-    unsafe fn rotate_cols(self) -> C8 {
-        C8(_mm_shuffle_epi32::<0b01001110>(self.0))
-    }
-    #[inline(always)]
-    unsafe fn all_zero(self) -> bool {
-        _mm_testz_si128(self.0, self.0) != 0
-    }
-    #[inline(always)]
-    unsafe fn intersects(self, o: C8) -> bool {
-        _mm_testz_si128(self.0, o.0) == 0
-    }
-    /// Total set bits across the vector.
-    #[inline(always)]
-    unsafe fn popcount(self) -> u32 {
-        let lo = _mm_cvtsi128_si64(self.0) as u64;
-        let hi = _mm_extract_epi64::<1>(self.0) as u64;
-        lo.count_ones() + hi.count_ones()
-    }
-    /// Lowest set bit of each 16-bit lane.
-    #[inline(always)]
-    unsafe fn low_bit_per_lane(self) -> C8 {
-        let neg = _mm_sub_epi16(_mm_setzero_si128(), self.0);
-        C8(_mm_and_si128(self.0, neg))
-    }
-    /// Clear the lowest set bit of the vector viewed as one long integer.
-    #[inline(always)]
-    unsafe fn clear_low_bit(self) -> C8 {
-        let cmp = _mm_cmpgt_epi64(self.0, _mm_setzero_si128());
-        let one = _mm_andnot_si128(_mm_slli_si128::<1>(cmp), _mm_srli_epi64::<63>(cmp));
-        C8(_mm_and_si128(self.0, _mm_sub_epi64(self.0, one)))
-    }
-    /// (min value, lane) over lanes after subtracting `floor`; packed as
-    /// value in bits 0..16, lane in bits 16..19 (via phminposuw).
-    #[inline(always)]
-    unsafe fn minpos_after_sub(self, floor: u16) -> u32 {
-        let adj = _mm_sub_epi16(self.0, _mm_set1_epi16(floor as i16));
-        _mm_cvtsi128_si32(_mm_minpos_epu16(adj)) as u32
-    }
-}
-
-impl C16 {
-    #[inline(always)]
-    unsafe fn all(v: u16) -> C16 {
-        C16(_mm256_set1_epi16(v as i16))
-    }
-    #[inline(always)]
-    unsafe fn from_parts(lo: C8, hi: C8) -> C16 {
-        C16(_mm256_set_m128i(hi.0, lo.0))
-    }
-    #[inline(always)]
-    unsafe fn get_lo(self) -> C8 {
-        C8(_mm256_castsi256_si128(self.0))
-    }
-    #[inline(always)]
-    unsafe fn get_hi(self) -> C8 {
-        C8(_mm256_extracti128_si256::<1>(self.0))
-    }
-    #[inline(always)]
-    unsafe fn and(self, o: C16) -> C16 {
-        C16(_mm256_and_si256(self.0, o.0))
-    }
-    #[inline(always)]
-    unsafe fn or(self, o: C16) -> C16 {
-        C16(_mm256_or_si256(self.0, o.0))
-    }
-    #[inline(always)]
-    unsafe fn xor(self, o: C16) -> C16 {
-        C16(_mm256_xor_si256(self.0, o.0))
-    }
-    /// self & !o
-    #[inline(always)]
-    unsafe fn and_not(self, o: C16) -> C16 {
-        C16(_mm256_andnot_si256(o.0, self.0))
-    }
-    #[inline(always)]
-    unsafe fn shuffle(self, ctrl: C16) -> C16 {
-        C16(_mm256_shuffle_epi8(self.0, ctrl.0))
-    }
-    #[inline(always)]
-    unsafe fn subset_of(self, o: C16) -> bool {
-        _mm256_testc_si256(o.0, self.0) != 0
-    }
-    #[inline(always)]
-    unsafe fn which_equal(self, o: C16) -> C16 {
-        C16(_mm256_cmpeq_epi16(self.0, o.0))
-    }
-    #[inline(always)]
-    unsafe fn which_nonzero(self) -> C16 {
-        C16(_mm256_cmpgt_epi16(self.0, _mm256_setzero_si256()))
-    }
-    #[inline(always)]
-    unsafe fn any_less_than(self, o: C16) -> bool {
-        let lt = _mm256_cmpgt_epi16(o.0, self.0);
-        // Deliberately a movemask rather than the shorter PTEST form: PTEST
-        // keeps the check on the vector ports, which are the bottleneck in
-        // this loop, while movemask hands it to the integer side. Measured
-        // ~1% faster despite costing an extra instruction.
-        _mm256_movemask_epi8(lt) != 0
-    }
-    /// Per-lane popcount, assuming the 7 high bits of every lane are zero.
-    ///
-    /// The nibble table is left as a plain constant. Pinning it in a register
-    /// with inline asm was tried: it did remove the per-iteration
-    /// `vbroadcasti128`, but spending one of sixteen vector registers cost
-    /// three instructions elsewhere and measured no faster. The broadcast
-    /// issues on the load port, which this loop is not short of.
-    #[inline(always)]
-    unsafe fn popcounts9(self) -> C16 {
-        let lut = _mm256_setr_epi8(
-            0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3,
-            2, 3, 3, 4,
-        );
-        let mask4 = _mm256_set1_epi16(0x0f);
-        let sum_0_3 = _mm256_shuffle_epi8(lut, _mm256_and_si256(self.0, mask4));
-        let sum_4_7 = _mm256_shuffle_epi8(lut, _mm256_srli_epi16::<4>(self.0));
-        let sum_0_7 = _mm256_add_epi16(sum_0_3, sum_4_7);
-        C16(_mm256_add_epi16(sum_0_7, _mm256_srli_epi16::<8>(self.0)))
-    }
-    /// Rotate the elements of each matrix row left by one.
-    /// Shift each matrix row's elements up by one position, zero-filling.
-    /// A matrix row is one 64-bit lane, so this is a lane-wise shift.
-    #[inline(always)]
-    unsafe fn shift_rows_up1(self) -> C16 {
-        C16(_mm256_slli_epi64::<16>(self.0))
-    }
-    /// Shift each matrix row's elements up by two positions, zero-filling.
-    #[inline(always)]
-    unsafe fn shift_rows_up2(self) -> C16 {
-        C16(_mm256_slli_epi64::<32>(self.0))
-    }
-    #[inline(always)]
-    unsafe fn rotate_rows(self) -> C16 {
-        let ctrl = _mm256_setr_epi8(
-            2, 3, 4, 5, 6, 7, 0, 1, 10, 11, 12, 13, 14, 15, 8, 9, 2, 3, 4, 5, 6, 7, 0, 1, 10,
-            11, 12, 13, 14, 15, 8, 9,
-        );
-        C16(_mm256_shuffle_epi8(self.0, ctrl))
-    }
-    /// Rotate the elements of each matrix row left by two.
-    #[inline(always)]
-    unsafe fn rotate_rows2(self) -> C16 {
-        C16(_mm256_shuffle_epi32::<0b10110001>(self.0))
-    }
-    /// Rotate the elements of each matrix row left by three.
-    #[inline(always)]
-    unsafe fn rotate_rows3(self) -> C16 {
-        unsafe { C16(_mm256_shuffle_epi8(self.0, c16(&ROW_ROT3).0)) }
-    }
-    /// Rotate the matrix rows up by one (element (r,c) <- (r+1,c)).
-    /// Exchange matrix rows 0,1 with rows 2,3 (the two 128-bit halves).
-    #[inline(always)]
-    unsafe fn swap_row_pairs(self) -> C16 {
-        C16(_mm256_permute2x128_si256::<0x01>(self.0, self.0))
-    }
-    /// Exchange matrix row 0 with 1 and row 2 with 3 (in-lane).
-    #[inline(always)]
-    unsafe fn swap_rows_in_pair(self) -> C16 {
-        C16(_mm256_shuffle_epi32::<0x4E>(self.0))
-    }
-    #[inline(always)]
-    unsafe fn rotate_cols(self) -> C16 {
-        C16(_mm256_permute4x64_epi64::<0b00111001>(self.0))
-    }
-    /// Rotate the matrix rows up by two.
-    #[inline(always)]
-    unsafe fn rotate_cols2(self) -> C16 {
-        C16(_mm256_permute4x64_epi64::<0b01001110>(self.0))
-    }
-    /// Rotate the matrix rows up by three.
-    #[inline(always)]
-    unsafe fn rotate_cols3(self) -> C16 {
-        C16(_mm256_permute4x64_epi64::<0b10010011>(self.0))
-    }
-    #[inline(always)]
-    unsafe fn extract_rows_u64(self) -> [u64; 4] {
-        [
-            _mm256_extract_epi64::<0>(self.0) as u64,
-            _mm256_extract_epi64::<1>(self.0) as u64,
-            _mm256_extract_epi64::<2>(self.0) as u64,
-            _mm256_extract_epi64::<3>(self.0) as u64,
-        ]
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tables
@@ -382,22 +132,7 @@ static POS_TRIADS_TO_CANDIDATES: [[[u16; 16]; 2]; 2] = [
     ],
 ];
 
-static CELL3X3_MASK: [u16; 16] = [
-    ALL, ALL, ALL, 0, ALL, ALL, ALL, 0, ALL, ALL, ALL, 0, 0, 0, 0, 0,
-];
 
-// Row rotations restricted to the 3x3 submatrix (margins kept in place).
-// Rotate each 4-wide matrix row right by one (i.e. left by three).
-static ROW_ROT3: [u16; 16] = [
-    S3, S0, S1, S2, S7, S4, S5, S6, S3, S0, S1, S2, S7, S4, S5, S6,
-];
-
-static ROW_ROTATE_3X3_1: [u16; 16] = [
-    S1, S2, S0, S3, S5, S6, S4, S7, S1, S2, S0, S3, S4, S5, S6, S7,
-];
-static ROW_ROTATE_3X3_2: [u16; 16] = [
-    S2, S0, S1, S3, S6, S4, S5, S7, S2, S0, S1, S3, S4, S5, S6, S7,
-];
 
 // Extracts horizontal triad literals (matrix lanes 3, 7, 11) into lanes 4..6.
 // Controls for the fused triad-message build (see `triad_message`). A takes
@@ -406,15 +141,6 @@ static ROW_ROTATE_3X3_2: [u16; 16] = [
 // because the vertical triads already sit at positions 4..6 there. B picks
 // the third horizontal triad (matrix lane 11) out of the *other* 128-bit
 // lane, which is why its input is the half-swapped vector.
-static TRIAD_MSG_A: [u16; 16] = [
-    XX, XX, XX, XX, S3, S7, XX, XX, // low: lanes 3,7 -> 4,5
-    S0, S1, S2, S3, S4, S5, S6, S7, // high: identity passthrough
-];
-static TRIAD_MSG_B: [u16; 16] = [
-    XX, XX, XX, XX, XX, XX, S3, XX, // low: swapped lane 3 (= lane 11) -> 6
-    XX, XX, XX, XX, XX, XX, XX, XX, // high: contribute nothing
-];
-
 // Minimum candidates per lane: cells >= 1; negative triads >= 6, because
 // exactly 3 of 9 digits live in a triad. Popcount equality with the minimum
 // triggers assertion of everything left in the lane.
@@ -530,26 +256,6 @@ unsafe fn positive_triads_to_box_candidates(triads: C8, orientation: usize) -> C
         .or(tmp.shuffle(c16(&POS_TRIADS_TO_CANDIDATES[orientation][1])))
 }
 
-/// Build the band elimination message from a box vector: horizontal triad
-/// literals in positions 4..6 of the low half, vertical triads in positions
-/// 4..6 of the high half.
-///
-/// Done as one fused permutation rather than extracting the two triad sets
-/// and reassembling them. The high half needs no work at all -- the vertical
-/// triads already occupy positions 4..6 there -- and of the three horizontal
-/// triads, only the third lives in the other 128-bit lane, so a single
-/// half-swap plus two in-lane shuffles reaches everything.
-///
-/// Replaces shuffle + 2x vextracti128 + or + vinserti128 (4 shuffle-port
-/// ops) with vpermq + 2x vpshufb + or (3 shuffle-port ops), per call site.
-#[inline(always)]
-unsafe fn triad_message(x: C16) -> C16 {
-    let swapped = x.rotate_cols2(); // swap the two 128-bit halves
-    C16(_mm256_or_si256(
-        _mm256_shuffle_epi8(x.0, c16(&TRIAD_MSG_A).0),
-        _mm256_shuffle_epi8(swapped.0, c16(&TRIAD_MSG_B).0),
-    ))
-}
 
 /// Turn newly asserted literals into further box eliminations plus band
 /// elimination messages. See the port source for the full derivation.
@@ -562,7 +268,7 @@ unsafe fn assertions_to_eliminations(
     h_band_eliminations: &mut C8,
     v_band_eliminations: &mut C8,
 ) {
-    let cell_assertions_only = assertions.and(c16(&CELL3X3_MASK));
+    let cell_assertions_only = assertions.and(c16(&CELLS_3X3));
     // Row broadcast. A matrix row is exactly one 64-bit lane, so a two-step
     // shift-and-or carries each row's union up to its top element -- the
     // horizontal triad, the only lane that needs it, since inside the 3x3 the
@@ -586,13 +292,10 @@ unsafe fn assertions_to_eliminations(
     // half -- unions all four rows into every row. Two shuffles and two ors
     // rather than three cross-lane permutes and three ors, and the second
     // fold is an in-lane `vpshufd` rather than another `vpermq`.
-    let half = cell_assertions_only.or(cell_assertions_only.swap_row_pairs());
-    let across_cols = half.or(half.swap_rows_in_pair());
     // The 3x3 submatrix eliminates an asserted digit everywhere in the box;
     // margins pick up row/col broadcasts; asserted cells eliminate all bits.
-    let new_box_elims = across_cols
-        .or(across_cols.shuffle(c16(&ROW_ROTATE_3X3_1)))
-        .or(across_cols.shuffle(c16(&ROW_ROTATE_3X3_2)))
+    let new_box_elims = cell_assertions_only
+        .box_and_column_unions()
         .or(across_rows)
         .or(cell_assertions_only.which_nonzero());
     // Keep the asserted candidate itself in its own cell. This replaces the
@@ -604,8 +307,8 @@ unsafe fn assertions_to_eliminations(
     // Negative triad assertions kill the configurations placing the digit
     // there (shift 0); asserted cells imply positive triads, killing the
     // configurations placing the digit at the other elements (shifts 1, 2).
-    let hv_neg = triad_message(assertions);
-    let hv_pos = triad_message(new_box_elims);
+    let hv_neg = assertions.triad_message();
+    let hv_pos = new_box_elims.triad_message();
     let idx = box_j * 3 + box_i;
     let new_elims = hv_neg
         .shuffle(c16(&TRIADS_SHIFT0_TO_CONFIG_ELIMS16[idx]))
@@ -698,14 +401,8 @@ unsafe fn box_fixpoint(state: &mut TState, box_idx: usize, candidates: C16) -> b
         // and the dependency chain drops from a six-deep serial accumulation
         // to a two-level OR tree off the rotations.
         let triggered = counts.which_equal(box_minimums);
-        let row_peers = cells
-            .rotate_rows()
-            .or(cells.rotate_rows2())
-            .or(cells.rotate_rows3());
-        let col_peers = cells
-            .rotate_cols()
-            .or(cells.rotate_cols2())
-            .or(cells.rotate_cols3());
+        let row_peers = cells.row_peers();
+        let col_peers = cells.col_peers();
         let assertions = cells.and_not(row_peers.and(col_peers).and_not(triggered));
 
         // Loop exit. Everything downstream -- the box's own elimination
@@ -780,8 +477,32 @@ unsafe fn band_eliminate<const VERTICAL: usize>(
 ///
 /// `sysv64`: under the Windows x64 ABI xmm6-xmm15 are callee-saved, so every
 /// entry to this recursive function spills and reloads ten vector registers.
-/// The SysV convention treats all of them as volatile.
+/// The SysV convention treats all of them as volatile. Rust has no way to
+/// make an ABI conditional, and `sysv64` does not exist off x86-64, so the
+/// body lives in an always-inlined inner function and this is the one place
+/// the two architectures need separate declarations. On aarch64 the default
+/// ABI already leaves only the low 64 bits of v8-v15 callee-saved, and the
+/// register file is twice as large, so there is nothing to recover here.
+#[cfg(target_arch = "x86_64")]
 unsafe extern "sysv64" fn band_eliminate_full<const VERTICAL: usize>(
+    state: &mut TState,
+    band_idx: usize,
+    from_peer: usize,
+) -> bool {
+    band_eliminate_body::<VERTICAL>(state, band_idx, from_peer)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn band_eliminate_full<const VERTICAL: usize>(
+    state: &mut TState,
+    band_idx: usize,
+    from_peer: usize,
+) -> bool {
+    band_eliminate_body::<VERTICAL>(state, band_idx, from_peer)
+}
+
+#[inline(always)]
+unsafe fn band_eliminate_body<const VERTICAL: usize>(
     state: &mut TState,
     band_idx: usize,
     from_peer: usize,
@@ -881,18 +602,17 @@ const NONE: u32 = u32::MAX;
 /// (band 0..6 or NONE, digit mask replicated across config lanes).
 #[inline]
 unsafe fn choose_band_and_value(state: &TState) -> (u32, C8, bool) {
-    // A fixed band has exactly 9 configuration bits (one per digit).
-    let counts = [
-        state.bands[0][0].configurations.popcount() as u16,
-        state.bands[1][0].configurations.popcount() as u16,
-        state.bands[2][0].configurations.popcount() as u16,
-        state.bands[0][1].configurations.popcount() as u16,
-        state.bands[1][1].configurations.popcount() as u16,
-        state.bands[2][1].configurations.popcount() as u16,
-        0xffff,
-        0xffff,
-    ];
-    let config_minpos = c8(&counts).minpos_after_sub(10);
+    // A fixed band has exactly 9 configuration bits (one per digit), so
+    // subtracting 10 puts every fixed band above every unfixed one.
+    let counts = band_config_counts([
+        state.bands[0][0].configurations,
+        state.bands[1][0].configurations,
+        state.bands[2][0].configurations,
+        state.bands[0][1].configurations,
+        state.bands[1][1].configurations,
+        state.bands[2][1].configurations,
+    ]);
+    let config_minpos = counts.minpos_after_sub(10);
     if config_minpos & 0xff00 != 0 {
         return (NONE, C8::zero(), false);
     }
@@ -1125,9 +845,9 @@ unsafe fn seed_peer_eliminations(
     row_digits: &[u16; 12],
     col_digits: &[u16; 12],
 ) {
-    let row_ctrl = C16(_mm256_loadu_si256(ROW_BCAST.as_ptr() as *const __m256i));
-    let col_ctrl = C16(_mm256_loadu_si256(COL_BCAST.as_ptr() as *const __m256i));
-    let cells_only = c16(&CELL3X3_MASK);
+    let row_ctrl = c16_bytes(&ROW_BCAST);
+    let col_ctrl = c16_bytes(&COL_BCAST);
+    let cells_only = c16(&CELLS_3X3);
     let one = C16::all(1);
     for bx in 0..9 {
         // SAFETY: bx < 9, so the band offsets are at most 6 and the quadword
@@ -1136,9 +856,9 @@ unsafe fn seed_peer_eliminations(
         let cp = col_digits.as_ptr().add(*MOD3.get_unchecked(bx) * 3);
         let r = (rp as *const u64).read_unaligned();
         let c = (cp as *const u64).read_unaligned();
-        let spread = C16(_mm256_set1_epi64x(r as i64))
+        let spread = C16::splat_u64(r)
             .shuffle(row_ctrl)
-            .or(C16(_mm256_set1_epi64x(c as i64)).shuffle(col_ctrl));
+            .or(C16::splat_u64(c).shuffle(col_ctrl));
         let cells = *state.boxen.get_unchecked(bx);
         let settled = cells.popcounts9().which_equal(one);
         *state.boxen.get_unchecked_mut(bx) =
@@ -1147,48 +867,30 @@ unsafe fn seed_peer_eliminations(
 }
 
 unsafe fn init_and_propagate(state: &mut TState, clues: &[u8; 81]) -> bool {
-    // Build a bitmask of clue positions branchlessly (three overlapping
-    // 32-byte loads; the third covers cells 49..81), then bit-scan it, so
-    // the random clue pattern costs no branch mispredictions.
-    let zero = _mm256_setzero_si256();
-    let p = clues.as_ptr();
-    let m_a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
-        _mm256_loadu_si256(p as *const __m256i),
-        zero,
-    )) as u32;
-    let m_b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
-        _mm256_loadu_si256(p.add(32) as *const __m256i),
-        zero,
-    )) as u32;
-    let m_c = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
-        _mm256_loadu_si256(p.add(49) as *const __m256i),
-        zero,
-    )) as u32;
-    let mut lo = !(m_a as u64 | (m_b as u64) << 32); // clue cells 0..64
-    let mut hi = (!m_c >> 15) & 0x1ffff; // clue cells 64..81
     // Digits already placed in each row and column, for `seed_peer_eliminations`.
     // Padded to 12 so the quadword loads below stay in bounds.
     let mut row_digits = [0u16; 12];
     let mut col_digits = [0u16; 12];
-    while lo != 0 {
-        let cell = lo.trailing_zeros() as usize;
-        lo &= lo - 1;
+    // Clue positions as a bitmask, then a bit-scan, so the random clue
+    // pattern costs no branch mispredictions.
+    // SAFETY: every bit set in the masks is a cell index below 81, keeping
+    // `clues`, `ROW_COL_OF` and the padded digit arrays all in range.
+    let (mut lo, mut hi) = crate::clue_scan::clue_masks(clues);
+    let mut enter = |cell: usize| {
         let digit = *clues.get_unchecked(cell);
         init_clue(state, cell, digit);
         let rc = ROW_COL_OF.get_unchecked(cell);
         let bit = 1u16 << (digit - 1);
         *row_digits.get_unchecked_mut(rc[0] as usize) |= bit;
         *col_digits.get_unchecked_mut(rc[1] as usize) |= bit;
+    };
+    while lo != 0 {
+        enter(lo.trailing_zeros() as usize);
+        lo &= lo - 1;
     }
     while hi != 0 {
-        let cell = 64 + hi.trailing_zeros() as usize;
+        enter(64 + hi.trailing_zeros() as usize);
         hi &= hi - 1;
-        let digit = *clues.get_unchecked(cell);
-        init_clue(state, cell, digit);
-        let rc = ROW_COL_OF.get_unchecked(cell);
-        let bit = 1u16 << (digit - 1);
-        *row_digits.get_unchecked_mut(rc[0] as usize) |= bit;
-        *col_digits.get_unchecked_mut(rc[1] as usize) |= bit;
     }
     seed_peer_eliminations(state, &row_digits, &col_digits);
     // Drain each box before the bands run. The seeded eliminations can leave
