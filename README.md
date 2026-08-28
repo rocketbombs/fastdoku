@@ -51,7 +51,7 @@ checksums match tdoku's exactly — 3.3M puzzles, bit-identical grids.
 `puzzles7_serg_benchmark` is entirely multi-solution (`fastdoku check`
 reports 10,000/10,000 multiple); there the first solution found is
 engine-dependent, and fastdoku's checksum matches rust_sudoku's. Every
-returned grid is additionally validated cell by cell, and the five engines
+returned grid is additionally validated cell by cell, and the three engines
 are cross-validated against each other on every solve in the test suite.
 
 ### Does it hold up off the development machine?
@@ -118,7 +118,7 @@ lookup. Very little work per deduction, so it sprints through puzzles that
 are long chains of easy deductions, which is most puzzles.
 
 **`triad`** is a Rust port of tdoku's DPLL + triad + SIMD architecture: a box
-is one 256-bit vector holding a 4x4 matrix of 9-bit candidate sets, with
+is 256 bits holding a 4x4 matrix of 9-bit candidate sets, with
 negative triad literals in the margins, and a band is the six ways a digit's
 triads can sit in it. Much more work per step, much stronger inference, so
 it wins once puzzles are hard enough that the guesses it avoids pay for the
@@ -130,10 +130,12 @@ whichever engine finishes — and routes on how many cells remain unsolved at
 the first guess point: solved outright or near it stays in jcz, stalled far
 from a solution restarts in triad.
 
-Three older engines (`band`, `simd`, `baseline`) are kept selectable. They
-are slower, but they are independent implementations, and cross-validating
-five solvers against each other on every test is what makes the unsafe SIMD
-code maintainable.
+**`baseline`** is a plain cell-mask solver, kept selectable and exercised on
+every test. It is far slower than either engine and that is not the point:
+it is short enough to read in one sitting and has no `unsafe` in it, so it
+is the reference the other two are checked against. Cross-validating the
+fast engines against something simple enough to be obviously correct is what
+makes the unsafe SIMD code maintainable.
 
 [INVESTIGATIONS.md](INVESTIGATIONS.md) covers all of this properly: how each
 engine works, every optimization and what it measured, the routing analysis
@@ -149,9 +151,9 @@ fastdoku bench <file> [--rounds N] [--threads N] [--limit N] [--engine E]
 fastdoku gen <count> [--seed N]    generate minimal unique puzzles
 ```
 
-Engines for `bench --engine`: `auto` (default), `triad`, `jcz`, `band`,
-`simd`, `baseline`. `#` comments and blank lines are skipped, so tdoku's
-corpora and Norvig's lists work as-is.
+Engines for `bench --engine`: `auto` (default), `triad`, `jcz`, `baseline`.
+`#` comments and blank lines are skipped, so tdoku's corpora and Norvig's
+lists work as-is.
 
 ```bash
 cargo build --release
@@ -176,7 +178,7 @@ solver needs neither.
 
 ## Correctness
 
-- `cargo test` cross-validates all five engines against each other on
+- `cargo test` cross-validates all three engines against each other on
   hundreds of random puzzles — valid, minimal, over-clued, contradictory and
   multi-solution — asserting identical solution counts and validating every
   grid returned.

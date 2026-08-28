@@ -174,15 +174,24 @@ fn cmd_check(file: &str) {
 }
 
 fn cmd_bench(file: &str, rounds: usize, threads: usize, engine: &str, limit: usize) {
+    // An unrecognised name is an error rather than a silent fall back to
+    // `auto`: the timing line prints whatever was asked for, so falling back
+    // would label `auto`'s numbers with the missing engine's name.
     let f: SolveFn = match engine {
+        "auto" => auto_solve_grid,
         "baseline" => baseline_solve_grid,
-        "band" => band_solve_grid,
         "jcz" => jcz_solve_grid,
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        "simd" => simd_solve_grid,
         #[cfg(triad_engine)]
         "triad" => triad_solve_grid,
-        _ => auto_solve_grid,
+        #[cfg(not(triad_engine))]
+        "triad" => {
+            eprintln!("engine `triad` is not compiled for this target");
+            std::process::exit(2);
+        }
+        other => {
+            eprintln!("unknown engine `{other}`: expected auto, jcz, triad or baseline");
+            std::process::exit(2);
+        }
     };
     let mut puzzles = read_puzzles(file);
     puzzles.truncate(limit);
@@ -258,7 +267,7 @@ fn cmd_gen(count: usize, seed: u64) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage:\n  fastdoku solve <file|->\n  fastdoku check <file|->\n  fastdoku bench <file> [--rounds N] [--threads N] [--limit N] [--engine auto|jcz|triad|band|simd|baseline]\n  fastdoku gen <count> [--seed N]";
+    let usage = "usage:\n  fastdoku solve <file|->\n  fastdoku check <file|->\n  fastdoku bench <file> [--rounds N] [--threads N] [--limit N] [--engine auto|jcz|triad|baseline]\n  fastdoku gen <count> [--seed N]";
     if args.len() < 2 {
         eprintln!("{usage}");
         std::process::exit(2);

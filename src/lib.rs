@@ -1,13 +1,14 @@
 //! fastdoku — a fast, complete sudoku solver.
 //!
-//! Five engines, cross-validated against each other in the test suite:
+//! Three engines, cross-validated against each other in the test suite:
 //! - `triad`: a port of tdoku's DPLL + triad + SIMD architecture, over AVX2
 //!   or NEON; the strongest inference, fastest on hard puzzles.
 //! - `jcz`: an original implementation of the JCZSolve architecture (bands
 //!   by digit, locked candidates by table lookup); the cheapest per easy
 //!   deduction, fastest on easy and typical puzzles. Scalar, portable.
-//! - `band`, `simd`, `baseline`: earlier designs, kept selectable for
-//!   benchmarking and as independent implementations for cross-validation.
+//! - `baseline`: a plain cell-mask solver. Slow, but short enough to read in
+//!   one sitting and written without a line of `unsafe`, which is what makes
+//!   it useful as the reference the other two are checked against.
 //!
 //! The CLI's default `auto` engine routes each puzzle between `jcz` and
 //! `triad` using `jcz::run`'s difficulty gate (see that function). Common
@@ -16,8 +17,6 @@
 //! search counts solutions to a limit, so uniqueness checking and "solve
 //! any valid sudoku" completeness fall out of one code path.
 
-pub mod band;
-
 pub mod jcz;
 
 mod clue_scan;
@@ -25,18 +24,11 @@ mod clue_scan;
 #[cfg(triad_engine)]
 mod tvec;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-pub mod simd;
-
 /// Gated on `cfg(triad_engine)`, which `build.rs` sets for targets with a
 /// backend for the engine's vector vocabulary: AVX2 on x86-64, NEON on
 /// aarch64.
 #[cfg(triad_engine)]
 pub mod triad;
-
-/// True when the AVX2 engine is compiled in (requires `-C target-cpu=native`
-/// or `-C target-feature=+avx2`). Otherwise the band engine is the default.
-pub const HAS_SIMD: bool = cfg!(all(target_arch = "x86_64", target_feature = "avx2"));
 
 /// True when the `triad` engine is compiled in.
 pub const HAS_TRIAD: bool = cfg!(triad_engine);
@@ -597,9 +589,8 @@ pub const HYBRID_GUESS_BUDGET: u32 = 16;
 /// found, or `None` if the puzzle has no solution.
 ///
 /// Where the `triad` engine is available this is it (a port of tdoku's
-/// architecture, over AVX2 or NEON);
-/// otherwise the scalar `band` engine. The CLI's default `auto` engine
-/// instead routes each puzzle between `jcz` and `triad` with
+/// architecture, over AVX2 or NEON); otherwise the scalar `jcz` engine. The
+/// CLI's default `auto` engine instead routes each puzzle between them with
 /// [`jcz::run`] — that dispatch lives in the binary because defining it
 /// here, in the same LTO unit as the triad hot path, measurably degrades
 /// the triad engine's codegen (~12% on the hard corpora).
@@ -611,7 +602,7 @@ pub fn solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
     }
     #[cfg(not(triad_engine))]
     {
-        band::solve_grid(clues)
+        jcz::solve_grid(clues)
     }
 }
 
@@ -624,7 +615,7 @@ pub fn count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
     }
     #[cfg(not(triad_engine))]
     {
-        band::count_solutions(clues, limit)
+        jcz::count_solutions(clues, limit)
     }
 }
 
@@ -637,16 +628,6 @@ pub fn jcz_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
 #[inline]
 pub fn jcz_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
     jcz::count_solutions(clues, limit)
-}
-
-#[inline]
-pub fn band_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
-    band::solve_grid(clues)
-}
-
-#[inline]
-pub fn band_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
-    band::count_solutions(clues, limit)
 }
 
 /// DPLL+triad+SIMD engine, ported from tdoku (BSD-2-Clause).
@@ -662,22 +643,8 @@ pub fn triad_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
     triad::count_solutions(clues, limit)
 }
 
-/// Dual-orientation AVX2 engine. Cross-validated against the others; kept
-/// selectable for benchmarking, but measured slower than `band`.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[inline]
-pub fn simd_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
-    simd::solve_grid(clues)
-}
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[inline]
-pub fn simd_count_solutions(clues: &[u8; 81], limit: u64) -> u64 {
-    simd::count_solutions(clues, limit)
-}
-
-/// Baseline engine (cell-mask + unit scans): kept for A/B benchmarking and
-/// cross-validation of the band engine.
+/// Baseline engine: cell masks and unit scans, no `unsafe` and no tables
+/// worth verifying. It is the reference the other two are checked against.
 pub fn baseline_solve_grid(clues: &[u8; 81]) -> Option<[u8; 81]> {
     let mut st = State::new();
     let mut q = Queue::new();
@@ -877,31 +844,15 @@ mod tests {
         assert!(solve_grid(&p).is_none());
     }
 
-    #[test]
-    fn exact_support_agrees_with_iterative_reduction() {
-        // The iterative "row/box confined" fixpoint and the exact
-        // permutation-support reduction must agree on all 512 occupancies.
-        band::check_support_tables();
-    }
-
     /// The three engines are independent implementations; on every puzzle
     /// they must agree on the solution count, and any solution any of them
     /// returns must be a valid completion of the clues.
     fn cross_check(p: &[u8; 81]) {
         let c_base = baseline_count_solutions(p, 2);
-        let c_band = band_count_solutions(p, 2);
-        assert_eq!(c_base, c_band, "band count differs on {}", grid_to_line(p));
         assert_eq!(
             c_base,
             jcz_count_solutions(p, 2),
             "jcz count differs on {}",
-            grid_to_line(p)
-        );
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        assert_eq!(
-            c_base,
-            simd_count_solutions(p, 2),
-            "simd count differs on {}",
             grid_to_line(p)
         );
         #[cfg(triad_engine)]
@@ -916,21 +867,13 @@ mod tests {
                 let s = sol.unwrap_or_else(|| panic!("{name} found no solution"));
                 assert!(is_valid_solution(&s, p), "{name} returned an invalid grid");
             };
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            check("simd", simd_solve_grid(p));
             #[cfg(triad_engine)]
             check("triad", triad_solve_grid(p));
-            for (name, sol) in [
-                ("baseline", baseline_solve_grid(p)),
-                ("band", band_solve_grid(p)),
-                ("jcz", jcz_solve_grid(p)),
-            ] {
-                let s = sol.unwrap_or_else(|| panic!("{name} found no solution"));
-                assert!(is_valid_solution(&s, p), "{name} returned an invalid grid");
-            }
+            check("baseline", baseline_solve_grid(p));
+            check("jcz", jcz_solve_grid(p));
         } else {
             assert!(solve_grid(p).is_none());
-            assert!(band_solve_grid(p).is_none());
+            assert!(jcz_solve_grid(p).is_none());
         }
     }
 
@@ -965,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn band_matches_baseline_on_random_puzzles() {
+    fn default_engine_matches_baseline_on_random_puzzles() {
         let mut rng = Rng(0x1234ABCD9876EF01);
         for iter in 0..300u64 {
             let sol = random_solved_grid(&mut rng);
@@ -985,7 +928,7 @@ mod tests {
             let cn = count_solutions(&p, 2);
             assert_eq!(cb, cn, "solution count mismatch on {}", grid_to_line(&p));
             if cn >= 1 {
-                let sn = solve_grid(&p).expect("band engine found no solution");
+                let sn = solve_grid(&p).expect("default engine found no solution");
                 assert!(is_valid_solution(&sn, &p));
                 if cn == 1 {
                     let sb = baseline_solve_grid(&p).unwrap();

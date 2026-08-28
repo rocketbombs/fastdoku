@@ -1,7 +1,6 @@
 # Release build for fastdoku.
 #
-# PGO is the default: it is worth 1.5-4% on the triad engine. (It measured a
-# small regression on the older band engine -- re-measure after big changes.)
+# PGO is the default: it is worth 1.5-4% on the triad engine.
 # `-C target-cpu=native` comes from .cargo/config.toml and enables AVX2.
 #
 # Pass -NoPgo for a plain optimized build.

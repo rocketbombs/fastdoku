@@ -608,7 +608,13 @@ instructions. Only changes that cut both won.
 
 Earlier, before the port to tdoku's architecture, three original designs were
 built and measured: bitboards per digit and band with a permutation-support
-table, a dual-orientation variant holding each digit's board twice in one
-register, and a classic cell-mask solver. All three are slower and all three
-survive as `--engine band|simd|baseline`.
+table, a dual-orientation AVX2 variant holding each digit's board twice in
+one register, and a classic cell-mask solver. All three are slower than both
+shipped engines — the first two by 2x to 4x — and the first two have since
+been deleted: they were kept for cross-validation, but they only ever
+validated each other, and the vocabulary tests in
+[`src/tvec.rs`](src/tvec.rs) now check the SIMD primitives directly and far
+more sharply than "a second AVX2 engine agrees on this puzzle" ever did. The
+cell-mask solver stays as `--engine baseline`, because a reference with no
+`unsafe` in it is the one that earns its keep.
 
